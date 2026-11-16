@@ -47,3 +47,7 @@ out/
 *.sqlite
 *.sqlite3
 *.db
+
+# Expo 和 TypeScript 本地缓存
+.expo/
+*.tsbuildinfo

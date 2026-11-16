@@ -1,0 +1,10 @@
+{
+  "expo": {
+    "name": "笔迹脉搏",
+    "slug": "ink-pulse",
+    "version": "1.0.0",
+    "platforms": ["android"],
+    "orientation": "default",
+    "userInterfaceStyle": "light"
+  }
+}
