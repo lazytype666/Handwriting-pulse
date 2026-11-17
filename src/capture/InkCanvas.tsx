@@ -1,106 +1,163 @@
-import { forwardRef, memo, useCallback, useImperativeHandle, useState } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useState } from 'react';
 import { StyleSheet } from 'react-native';
-import { Canvas, Path, Skia } from '@shopify/react-native-skia';
-import {
-  GestureDetector,
-  GestureStateManager,
-  useManualGesture,
-} from 'react-native-gesture-handler';
+import { Canvas, PaintStyle, Path, Picture, Skia, StrokeCap, StrokeJoin, type SkPath } from '@shopify/react-native-skia';
+import { GestureDetector, GestureStateManager, useManualGesture } from 'react-native-gesture-handler';
 import { useFrameCallback, useSharedValue } from 'react-native-reanimated';
 import { runOnUIAsync, scheduleOnRN } from 'react-native-worklets';
-
-import {
-  appendPoint, beginStroke, copyStrokes, createRecorder, readDiagnostics,
-  type Diagnostics, type Stroke,
-} from './recorder';
+import { ERASER_WIDTH, REWRITE_WINDOW_MS, type InkTool, type StallEvent, type Thresholds } from '../stalls/config';
+import { cooldownLeft, createDetector, detect } from '../stalls/detection';
+import { createFeatures, observeTouch, pauseAt, speedRatioAt } from '../stalls/features';
+import { appendPoint, beginStroke, copyStrokes, createRecorder, readDiagnostics, type Diagnostics, type Stroke } from './recorder';
 
 export interface InkCanvasHandle {
-  snapshot(): Promise<Stroke[]>;
+  snapshot(): Promise<{ strokes: Stroke[]; stallEvents: StallEvent[] }>;
+  undo(): Promise<void>;
 }
 
 interface InkCanvasProps {
+  tool: InkTool;
+  thresholds: Thresholds;
+  onStall: (event: StallEvent) => void;
   onDiagnostics: (diagnostics: Diagnostics) => void;
 }
 
-export const InkCanvas = memo(forwardRef<InkCanvasHandle, InkCanvasProps>(
-  function InkCanvas({ onDiagnostics }, ref) {
-    // 这份记录只由 UI worklet 持有和更新。JS 在导出屏障处取得独立副本，
-    // 单点不触发 React 状态更新，也不在移动时跨线程复制全页数组。
-    const recorder = useSharedValue(createRecorder());
-    useImperativeHandle(ref, () => ({
-      snapshot: () => runOnUIAsync(() => {
-        'worklet';
-        return copyStrokes(recorder.value);
-      }),
-    }), [recorder]);
+const PEN_WIDTH = 2.25;
+const INK = '#23352f';
+const PAPER = '#ffffff';
+const REPORT_INTERVAL_MS = 125;
 
-    // Skia 的不可变路径用于显示，PathBuilder 用于累计轨迹。
-    // 书写中仅刷新当前笔的快照，完成笔只在收笔时并入底层路径。
-    const [geometry] = useState(() => ({
-      live: Skia.PathBuilder.Make(), finished: Skia.PathBuilder.Make(),
-      empty: Skia.PathBuilder.Make().build(),
-    }));
-    const livePath = useSharedValue(geometry.empty);
-    const finishedPath = useSharedValue(geometry.empty);
+function makePaint(color: string, width: number) {
+  const paint = Skia.Paint();
+  paint.setColor(Skia.Color(color));
+  paint.setStyle(PaintStyle.Stroke);
+  paint.setStrokeWidth(width);
+  paint.setStrokeCap(StrokeCap.Round);
+  paint.setStrokeJoin(StrokeJoin.Round);
+  paint.setAntiAlias(true);
+  return paint;
+}
+
+function makeGeometry() {
+  const picture = Skia.PictureRecorder();
+  picture.beginRecording();
+  return {
+    picture, blank: picture.finishRecordingAsPicture(),
+    builder: Skia.PathBuilder.Make(), empty: Skia.PathBuilder.Make().build(),
+    pen: makePaint(INK, PEN_WIDTH), eraser: makePaint(PAPER, ERASER_WIDTH),
+  };
+}
+
+export const InkCanvas = memo(forwardRef<InkCanvasHandle, InkCanvasProps>(
+  function InkCanvas({ tool, thresholds, onDiagnostics, onStall }, ref) {
+    const recorder = useSharedValue(createRecorder());
+    const features = useSharedValue(createFeatures());
+    const detector = useSharedValue(createDetector());
+    const chosen = useSharedValue(tool);
+    const limits = useSharedValue(thresholds);
+    const activeTool = useSharedValue<InkTool>('pen');
+    useEffect(() => { chosen.value = tool; }, [chosen, tool]);
+    useEffect(() => { limits.value = thresholds; }, [limits, thresholds]);
+
+    const [geometry] = useState(makeGeometry);
+    const paths = useSharedValue<{ path: SkPath; tool: InkTool }[]>([]);
+    const finished = useSharedValue(geometry.blank);
+    const livePen = useSharedValue(geometry.empty);
+    const liveEraser = useSharedValue(geometry.empty);
     const dirty = useSharedValue(false);
-    const lastDiagnosticsAt = useSharedValue(0);
-    const lastReported = useSharedValue<Diagnostics>({ rate: 0, delta: null });
+    const lastReportAt = useSharedValue(0);
+
+    const refreshPicture = () => {
+      'worklet';
+      // 在白纸上按时间顺序重放开源 Skia 路径。橡皮仅覆盖其经过的条带；
+      // 撤销橡皮后，被覆盖的笔画从原始路径恢复，之后画的笔可正常盖回。
+      const target = geometry.picture.beginRecording();
+      for (const saved of paths.value) {
+        target.drawPath(saved.path, saved.tool === 'eraser' ? geometry.eraser : geometry.pen);
+      }
+      finished.value = geometry.picture.finishRecordingAsPicture();
+    };
 
     const finishStroke = () => {
       'worklet';
       if (recorder.value.writer === null) return;
       recorder.value.writer = null;
-      geometry.finished.addPath(geometry.live.build());
-      geometry.live.reset();
-      livePath.value = geometry.empty;
-      finishedPath.value = geometry.finished.build();
+      paths.value.push({ path: geometry.builder.build(), tool: activeTool.value });
+      geometry.builder.reset();
+      livePen.value = geometry.empty;
+      liveEraser.value = geometry.empty;
       dirty.value = false;
+      refreshPicture();
     };
 
-    // 开源库 RNGH 负责分发原始触摸事件，Reanimated/Worklets 将回调放在 UI 线程。
-    // 每次只认落笔时选定的触点编号，防止第二根手指让笔迹跳到另一个位置。
+    useImperativeHandle(ref, () => ({
+      snapshot: () => runOnUIAsync(() => {
+        'worklet';
+        // 事件和点都由 UI 线程写入，同一屏障复制二者，不会漏掉 JS 尚未显示的事件。
+        return { strokes: copyStrokes(recorder.value), stallEvents: detector.value.events.map(e => ({ ...e })) };
+      }),
+      undo: () => runOnUIAsync(() => {
+        'worklet';
+        finishStroke();
+        const removed = recorder.value.strokes.pop();
+        if (!removed) return;
+        paths.value.pop();
+        if (removed.tool === 'eraser') {
+          features.value.eraseAt = -1;
+          features.value.erasePath = [];
+        }
+        refreshPicture();
+      }),
+    }));
+
+    const sample = (down: boolean, x: number, y: number, absoluteX: number, absoluteY: number, now: number) => {
+      'worklet';
+      // RNGH 负责分发，Reanimated/Worklets 在 UI 线程运行。按窗口坐标采集，
+      // 用画布局部坐标求弧长和擦除距离，题干展开改变画布位置也不会拼出伪线段。
+      const state = recorder.value;
+      const f = features.value;
+      const currentTool = activeTool.value;
+      const moved = !down && (f.lastX !== x || f.lastY !== y);
+      appendPoint(state, absoluteX, absoluteY, now);
+      const rewrite = observeTouch(f, currentTool, down, x, y, now, limits.value);
+      const event = detect(detector.value, f, rewrite, currentTool === 'pen' && moved, now,
+        state.lastTimestamp, absoluteX, absoluteY, limits.value);
+      if (event) scheduleOnRN(onStall, event);
+      if (down) geometry.builder.moveTo(x, y);
+      geometry.builder.lineTo(x, y);
+      dirty.value = true;
+    };
+
     const gesture = useManualGesture({
       shouldCancelWhenOutside: false,
-      onTouchesDown: (event) => {
+      onTouchesDown: event => {
         'worklet';
         const now = performance.now();
-        const state = recorder.value;
         const touch = event.changedTouches[0];
-        if (state.writer !== null || !touch) return;
-        beginStroke(state, touch.id);
-        appendPoint(state, touch.absoluteX, touch.absoluteY, now);
-        geometry.live.moveTo(touch.x, touch.y);
-        // 零长度线段使用圆端帽，小数点等轻点也能留下墨迹。
-        geometry.live.lineTo(touch.x, touch.y);
-        dirty.value = true;
+        if (recorder.value.writer !== null || !touch) return;
+        activeTool.value = chosen.value;
+        beginStroke(recorder.value, touch.id, activeTool.value);
+        sample(true, touch.x, touch.y, touch.absoluteX, touch.absoluteY, now);
         GestureStateManager.activate(event.handlerTag);
       },
-      onTouchesMove: (event) => {
+      onTouchesMove: event => {
         'worklet';
         const now = performance.now();
-        const state = recorder.value;
         for (const touch of event.changedTouches) {
-          if (touch.id === state.writer) {
-            appendPoint(state, touch.absoluteX, touch.absoluteY, now);
-            geometry.live.lineTo(touch.x, touch.y);
-            dirty.value = true;
-          }
+          if (touch.id === recorder.value.writer) sample(false, touch.x, touch.y, touch.absoluteX, touch.absoluteY, now);
         }
       },
-      onTouchesUp: (event) => {
+      onTouchesUp: event => {
         'worklet';
         const now = performance.now();
-        const state = recorder.value;
         for (const touch of event.changedTouches) {
-          if (touch.id === state.writer) {
-            appendPoint(state, touch.absoluteX, touch.absoluteY, now);
-            geometry.live.lineTo(touch.x, touch.y);
+          if (touch.id === recorder.value.writer) {
+            sample(false, touch.x, touch.y, touch.absoluteX, touch.absoluteY, now);
             finishStroke();
           }
         }
-        if (state.writer === null) GestureStateManager.deactivate(event.handlerTag);
+        if (recorder.value.writer === null) GestureStateManager.deactivate(event.handlerTag);
       },
-      onTouchesCancel: (event) => {
+      onTouchesCancel: event => {
         'worklet';
         for (const touch of event.changedTouches) {
           if (touch.id === recorder.value.writer) finishStroke();
@@ -108,7 +165,6 @@ export const InkCanvas = memo(forwardRef<InkCanvasHandle, InkCanvasProps>(
       },
       onFinalize: () => {
         'worklet';
-        // 系统打断或取消时保留已经送达的点；结束回调不制造额外的采样点。
         finishStroke();
       },
     });
@@ -116,33 +172,36 @@ export const InkCanvas = memo(forwardRef<InkCanvasHandle, InkCanvasProps>(
     useFrameCallback(useCallback(() => {
       'worklet';
       if (dirty.value) {
-        livePath.value = geometry.live.build();
+        const live = activeTool.value === 'pen' ? livePen : liveEraser;
+        live.value = geometry.builder.build();
         dirty.value = false;
       }
       const now = performance.now();
-      if (now - lastDiagnosticsAt.value < 125) return;
-      lastDiagnosticsAt.value = now;
-      const next = readDiagnostics(recorder.value, now);
-      if (next.rate !== lastReported.value.rate || next.delta !== lastReported.value.delta) {
-        lastReported.value = next;
-        scheduleOnRN(onDiagnostics, next);
-      }
-    }, [dirty, geometry, lastDiagnosticsAt, lastReported, livePath, onDiagnostics, recorder]));
+      if (now - lastReportAt.value < REPORT_INTERVAL_MS || features.value.lastTouch < 0) return;
+      lastReportAt.value = now;
+      const f = features.value;
+      const d = detector.value;
+      const nowRatio = speedRatioAt(f, now);
+      scheduleOnRN(onDiagnostics, {
+        ...readDiagnostics(recorder.value, now),
+        pauseMs: Math.round(pauseAt(f, now)),
+        speedRatio: nowRatio === null ? null : Math.round(nowRatio * 100) / 100,
+        rewritten: f.rewrittenAt >= 0 && now - f.rewrittenAt <= REWRITE_WINDOW_MS,
+        cooldownMs: Math.ceil(cooldownLeft(d, now, limits.value)),
+        lastStall: d.events.length ? d.events[d.events.length - 1].type : null,
+      });
+    }, [activeTool, detector, dirty, features, geometry, lastReportAt, limits, liveEraser, livePen, onDiagnostics, recorder]));
 
     return (
       <GestureDetector gesture={gesture}>
         <Canvas style={styles.surface}>
-          <Path path={finishedPath} {...pen} />
-          <Path path={livePath} {...pen} />
+          <Picture picture={finished} />
+          <Path path={livePen} style="stroke" color={INK} strokeWidth={PEN_WIDTH} strokeCap="round" strokeJoin="round" />
+          <Path path={liveEraser} style="stroke" color={PAPER} strokeWidth={ERASER_WIDTH} strokeCap="round" strokeJoin="round" />
         </Canvas>
       </GestureDetector>
     );
   },
 ));
 
-const pen = {
-  color: '#23352f', style: 'stroke', strokeWidth: 2.25,
-  strokeCap: 'round', strokeJoin: 'round',
-} as const;
-
-const styles = StyleSheet.create({ surface: { flex: 1 } });
+const styles = StyleSheet.create({ surface: { flex: 1, backgroundColor: PAPER } });

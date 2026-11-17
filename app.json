@@ -2,8 +2,12 @@
   "expo": {
     "name": "笔迹脉搏",
     "slug": "ink-pulse",
-    "description": "在安卓画布上用手指或手写笔书写，查看最近一秒的采样点数，并将笔迹导出为 JSON 文件。",
-    "version": "1.0.0",
+    "description": "安卓数学草稿纸，按笔记录书写，检测停顿涂改和速度骤降，提供分层提示并支持本地回看与导出。",
+    "version": "1.1.0",
+    "android": {
+      "package": "app.inkpulse.notebook",
+      "versionCode": 2
+    },
     "platforms": ["android"],
     "orientation": "default",
     "userInterfaceStyle": "light"

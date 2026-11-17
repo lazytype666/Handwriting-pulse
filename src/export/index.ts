@@ -1,10 +1,12 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import type { Stroke } from '../capture';
+import type { StallEvent } from '../stalls';
 
 export interface ExportReceipt {
   uri: string;
   strokeCount: number;
   pointCount: number;
+  stallCount: number;
 }
 
 let sequence = 0;
@@ -23,13 +25,14 @@ async function nextFileUri(date: Date): Promise<string> {
   }
 }
 
-export async function saveSnapshot(strokes: Stroke[]): Promise<ExportReceipt> {
+export async function saveSnapshot(strokes: Stroke[], stallEvents: StallEvent[] = []): Promise<ExportReceipt> {
   const now = new Date();
   const strokeCount = strokes.length;
   const pointCount = strokes.reduce((sum, stroke) => sum + stroke.points.length, 0);
   const data = JSON.stringify({
     meta: { exportedAt: now.toISOString(), strokeCount, pointCount },
     strokes,
+    stallEvents,
   });
   const uri = await nextFileUri(now);
   const pending = uri + '.part';
@@ -41,7 +44,7 @@ export async function saveSnapshot(strokes: Stroke[]): Promise<ExportReceipt> {
     await FileSystem.deleteAsync(pending, { idempotent: true }).catch(() => {});
     throw error;
   }
-  return { uri, strokeCount, pointCount };
+  return { uri, strokeCount, pointCount, stallCount: stallEvents.length };
 }
 
 export async function copyToFolder(receipt: ExportReceipt): Promise<string | null> {

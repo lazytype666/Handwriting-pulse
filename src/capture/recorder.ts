@@ -1,3 +1,5 @@
+import type { InkTool, StallType } from '../stalls/config';
+
 export interface Point {
   x: number;
   y: number;
@@ -7,11 +9,20 @@ export interface Point {
 export interface Stroke {
   id: number;
   points: Point[];
+  tool?: 'eraser';
 }
 
-export interface Diagnostics {
+interface SampleReadings {
   rate: number;
   delta: number | null;
+}
+
+export interface Diagnostics extends SampleReadings {
+  pauseMs: number;
+  rewritten: boolean;
+  speedRatio: number | null;
+  cooldownMs: number;
+  lastStall: StallType | null;
 }
 
 export interface Recorder {
@@ -32,10 +43,12 @@ export function createRecorder(): Recorder {
 
 // 自研采集器。调用方只传入当前执笔触点，落笔时分组，移动与抬笔只追加。
 // 不按帧补点，也不因两次坐标相同而丢掉真实回调。
-export function beginStroke(state: Recorder, pointerId: number): void {
+export function beginStroke(state: Recorder, pointerId: number, tool: InkTool = 'pen'): void {
   'worklet';
   state.writer = pointerId;
-  state.strokes.push({ id: state.strokes.length + 1, points: [] });
+  const stroke: Stroke = { id: state.strokes.length + 1, points: [] };
+  if (tool === 'eraser') stroke.tool = 'eraser';
+  state.strokes.push(stroke);
 }
 
 export function appendPoint(state: Recorder, x: number, y: number, now: number): void {
@@ -53,7 +66,7 @@ export function appendPoint(state: Recorder, x: number, y: number, now: number):
 
 // 使用未经整数修正的到达时间计算 (now - 1000, now] 内真实点数。
 // 显示节流与写点互相独立，停止书写后一秒内旧数据自然离窗。
-export function readDiagnostics(state: Recorder, now: number): Diagnostics {
+export function readDiagnostics(state: Recorder, now: number): SampleReadings {
   'worklet';
   const cutoff = now - 1000;
   let expired = 0;
@@ -68,6 +81,7 @@ export function copyStrokes(state: Recorder): Stroke[] {
   'worklet';
   return state.strokes.map(stroke => ({
     id: stroke.id,
+    ...(stroke.tool ? { tool: stroke.tool } : {}),
     points: stroke.points.map(point => ({ x: point.x, y: point.y, t: point.t })),
   }));
 }

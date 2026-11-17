@@ -1,6 +1,6 @@
 ---
 name: 功能建议
-about: 提出对书写采集、采样诊断或笔迹导出流程的改进
+about: 提出对书写工具、提示、卡壳历史或数据导出的改进
 title: "[建议] "
 labels: enhancement
 assignees: ''

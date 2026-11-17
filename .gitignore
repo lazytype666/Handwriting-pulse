@@ -16,6 +16,9 @@ desktop.ini
 *.key
 *.jks
 *.keystore
+credentials.json
+/android/
+/ios/
 
 # npm、Expo 与 TypeScript 生成的文件
 node_modules/

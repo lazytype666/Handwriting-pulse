@@ -1,7 +1,7 @@
 {
   "name": "ink-pulse",
-  "version": "1.0.0",
-  "description": "安卓手写草稿纸，按笔记录触点坐标与时间，显示采样诊断并导出 JSON。",
+  "version": "1.1.0",
+  "description": "安卓数学草稿纸，按笔记录轨迹、检测停顿涂改与速度骤降，提供分层提示并导出会话记录。",
   "license": "MIT",
   "private": true,
   "main": "index.ts",
@@ -21,6 +21,7 @@
     "react-native": "0.88.1",
     "react-native-gesture-handler": "~3.3.0",
     "react-native-reanimated": "4.7.1",
+    "react-native-safe-area-context": "~5.11.1",
     "react-native-worklets": "0.13.0"
   },
   "devDependencies": {
