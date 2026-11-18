@@ -25,7 +25,11 @@ async function nextFileUri(date: Date): Promise<string> {
   }
 }
 
-export async function saveSnapshot(strokes: Stroke[], stallEvents: StallEvent[] = []): Promise<ExportReceipt> {
+export async function saveSnapshot(
+  strokes: Stroke[],
+  stallEvents: StallEvent[] = [],
+  cognitiveSession?: Record<string, unknown>,
+): Promise<ExportReceipt> {
   const now = new Date();
   const strokeCount = strokes.length;
   const pointCount = strokes.reduce((sum, stroke) => sum + stroke.points.length, 0);
@@ -33,6 +37,7 @@ export async function saveSnapshot(strokes: Stroke[], stallEvents: StallEvent[] 
     meta: { exportedAt: now.toISOString(), strokeCount, pointCount },
     strokes,
     stallEvents,
+    cognitiveSession,
   });
   const uri = await nextFileUri(now);
   const pending = uri + '.part';

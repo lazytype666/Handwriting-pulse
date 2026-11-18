@@ -110,7 +110,8 @@ Expo 会把 `EXPO_PUBLIC_*` 写入客户端程序，持有 APK 的人可以从�
 
 - `src/capture/` 使用开源 Gesture Handler、Reanimated 与 Worklets 在 UI 线程接收触点，以单调时钟映射 Unix 毫秒。Skia 绘图随帧刷新，采样与显示分开执行。
 - `src/stalls/` 的距离、速度滑窗、停顿与涂改匹配、冷却和事件分组由项目自研。界面使用 React Native 及开源 Safe Area Context 适配系统边缘。
-- `src/hints/` 管理本地分层提示和兼容服务请求。在线内容由实际配置的模型服务生成。
+- `src/engine/` 端侧多源认知引擎由项目自研：构建三维连续认知状态空间 $s(t)=[M, R, A]$、个人运动指纹自适应、外环 7 维 LinUCB 个性化提示路由、解题图谱缓存与 5 秒书写恢复隐式反馈闭环。
+- `src/hints/` 管理本地分层提示、解题图谱缓存与兼容服务请求。在线内容由实际配置的模型服务生成。
 - `src/export/` 使用开源 expo-file-system 写入本机文件，先写临时文件再改名，安卓另存使用系统目录选择器。
 
 从 `main` 创建分支，并用中文写明设备、输入动作及验证结果。[贡献指南](CONTRIBUTING.md) · [MIT 许可证](LICENSE)
