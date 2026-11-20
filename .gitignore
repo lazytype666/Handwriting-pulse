@@ -40,3 +40,9 @@ logs/
 tmp/
 temp/
 *.tmp
+
+# Python 缓存与本地训练产出的模型权重
+__pycache__/
+*.pyc
+*.pyo
+ml/runs/

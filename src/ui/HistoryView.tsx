@@ -2,8 +2,10 @@ import { useMemo } from 'react';
 import { FlatList, Modal, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
+  ANNOTATION_LABEL_ZH,
   HINT_STYLES,
   HINT_STYLE_LABELS,
+  type AnnotationLabel,
   type PolicySnapshot,
 } from '../engine';
 import type { StallEvent, StallType } from '../stalls';
@@ -18,10 +20,11 @@ export const STALL_LABEL: Record<StallType, string> = {
 interface HistoryViewProps {
   events: StallEvent[];
   policySnapshot?: PolicySnapshot;
+  annotationCounts?: Record<AnnotationLabel, number>;
   onClose: () => void;
 }
 
-export function HistoryView({ events, policySnapshot, onClose }: HistoryViewProps) {
+export function HistoryView({ events, policySnapshot, annotationCounts, onClose }: HistoryViewProps) {
   const latestFirst = useMemo(() => [...events].reverse(), [events]);
   const pauseCount = useMemo(
     () => events.filter(e => e.type === 'pause_erase').length,
@@ -70,6 +73,18 @@ export function HistoryView({ events, policySnapshot, onClose }: HistoryViewProp
                           </Text>
                         );
                       })}
+                    </View>
+                  </View>
+                )}
+                {annotationCounts && (
+                  <View style={styles.policyBox}>
+                    <Text style={styles.policyTitle}>伴随微标注样本统计（供后续模型微调评测）</Text>
+                    <View style={styles.styleRow}>
+                      {(Object.keys(annotationCounts) as AnnotationLabel[]).map(label => (
+                        <Text key={label} style={styles.styleItem}>
+                          {ANNOTATION_LABEL_ZH[label]}：{annotationCounts[label]}
+                        </Text>
+                      ))}
                     </View>
                   </View>
                 )}

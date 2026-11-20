@@ -1,19 +1,23 @@
 import type { CompanionMode } from './cognitiveState';
 
 /**
- * 提示风格动作空间（对应外环 Contextual Bandit 的四个可选动作臂）。
+ * 提示风格动作空间（对应外环 Contextual Bandit 的六种大学数学启发动作臂）。
  */
 export type HintStyle =
   | 'socratic_question'   // 反问点拨
   | 'condition_reminder'  // 条件提醒
   | 'algebra_check'       // 算式纠错
-  | 'step_decompose';     // 拆步引导
+  | 'step_decompose'      // 拆步引导
+  | 'concept_recall'      // 概念唤醒
+  | 'sanity_check';       // 特值自检
 
 export const HINT_STYLES: HintStyle[] = [
   'socratic_question',
   'condition_reminder',
   'algebra_check',
   'step_decompose',
+  'concept_recall',
+  'sanity_check',
 ];
 
 export const HINT_STYLE_LABELS: Record<HintStyle, string> = {
@@ -21,6 +25,8 @@ export const HINT_STYLE_LABELS: Record<HintStyle, string> = {
   condition_reminder: '条件提醒',
   algebra_check: '算式纠错',
   step_decompose: '拆步引导',
+  concept_recall: '概念唤醒',
+  sanity_check: '特值自检',
 };
 
 export type FeedbackSignal =
@@ -140,6 +146,14 @@ function clamp(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v));
 }
 
+function createInitialArms(): Record<HintStyle, LinUcbArmState> {
+  const arms = {} as Record<HintStyle, LinUcbArmState>;
+  for (const s of HINT_STYLES) {
+    arms[s] = createInitialArm();
+  }
+  return arms;
+}
+
 export interface PolicyContextInput {
   momentumM: number;
   resistanceR: number;
@@ -148,6 +162,7 @@ export interface PolicyContextInput {
   eraseStress: number;
   speedRatio: number;
   triggerKind: 'pause_erase' | 'speed_drop' | 'cognitive_stall';
+  cognitiveCategory?: string;
 }
 
 /**
@@ -155,28 +170,18 @@ export interface PolicyContextInput {
  *
  * 【自研实现】设计思路：
  * 1. 上下文向量 x ∈ R^7 融合三维认知状态 [M, R, A]、停顿 Z 分数、涂改压力与速度比；
- * 2. 在 4 种启发风格间通过 UCB 上置信界做探索-利用权衡，并随学习次数渐进接管冷启动先验；
+ * 2. 在 6 种启发风格（反问/条件/纠错/拆步/概念唤醒/特值自检）间通过 UCB 权衡探索与利用；
  * 3. 根据隐式反馈（5 秒恢复书写 +1 / 秒关或点“我在想” -1）同步更新风格权重 θ_u 与触发门限偏置。
  */
 export class PersonalizedPolicyEngine {
   private mode: CompanionMode = 'socratic';
   private thresholdOffset = 0;
-  private arms: Record<HintStyle, LinUcbArmState> = {
-    socratic_question: createInitialArm(),
-    condition_reminder: createInitialArm(),
-    algebra_check: createInitialArm(),
-    step_decompose: createInitialArm(),
-  };
+  private arms: Record<HintStyle, LinUcbArmState> = createInitialArms();
   private feedbackLogs: FeedbackLogEntry[] = [];
 
   public reset(): void {
     this.thresholdOffset = 0;
-    this.arms = {
-      socratic_question: createInitialArm(),
-      condition_reminder: createInitialArm(),
-      algebra_check: createInitialArm(),
-      step_decompose: createInitialArm(),
-    };
+    this.arms = createInitialArms();
     this.feedbackLogs = [];
   }
 
@@ -204,15 +209,14 @@ export class PersonalizedPolicyEngine {
   }
 
   public exportSnapshot(): PolicySnapshot {
+    const armsCopy = {} as Record<HintStyle, LinUcbArmState>;
+    for (const s of HINT_STYLES) {
+      armsCopy[s] = { ...this.arms[s], aFlat: [...this.arms[s].aFlat], b: [...this.arms[s].b] };
+    }
     return {
       mode: this.mode,
       thresholdOffset: Number(this.thresholdOffset.toFixed(4)),
-      arms: {
-        socratic_question: { ...this.arms.socratic_question, aFlat: [...this.arms.socratic_question.aFlat], b: [...this.arms.socratic_question.b] },
-        condition_reminder: { ...this.arms.condition_reminder, aFlat: [...this.arms.condition_reminder.aFlat], b: [...this.arms.condition_reminder.b] },
-        algebra_check: { ...this.arms.algebra_check, aFlat: [...this.arms.algebra_check.aFlat], b: [...this.arms.algebra_check.b] },
-        step_decompose: { ...this.arms.step_decompose, aFlat: [...this.arms.step_decompose.aFlat], b: [...this.arms.step_decompose.b] },
-      },
+      arms: armsCopy,
       feedbackCount: this.feedbackLogs.length,
     };
   }
@@ -279,19 +283,40 @@ export class PersonalizedPolicyEngine {
   }
 
   private computeColdStartPrior(style: HintStyle, input: PolicyContextInput): number {
+    const cat = input.cognitiveCategory;
+    if (cat === 'CALC_MICRO_HESITATION' || cat === 'STUCK_CALCULATION') {
+      if (style === 'algebra_check') return 0.30;
+      if (style === 'sanity_check') return 0.25;
+      if (style === 'step_decompose') return 0.20;
+      return 0.08;
+    }
+    if (cat === 'DIRECTION_DRIFT_PITFALL') {
+      if (style === 'condition_reminder') return 0.30;
+      if (style === 'concept_recall') return 0.26;
+      if (style === 'socratic_question') return 0.18;
+      return 0.06;
+    }
+    if (cat === 'STUCK_CONCEPT_GAP') {
+      if (style === 'socratic_question') return 0.28;
+      if (style === 'concept_recall') return 0.24;
+      if (style === 'condition_reminder') return 0.20;
+      return 0.10;
+    }
+
     if (input.triggerKind === 'pause_erase') {
       if (style === 'algebra_check') return 0.28;
-      if (style === 'condition_reminder') return 0.22;
-      if (style === 'step_decompose') return 0.14;
+      if (style === 'sanity_check') return 0.22;
+      if (style === 'condition_reminder') return 0.18;
       return 0.12;
     }
     if (input.triggerKind === 'speed_drop') {
       if (style === 'step_decompose') return 0.26;
       if (style === 'socratic_question') return 0.22;
-      return 0.10;
+      return 0.12;
     }
     if (style === 'socratic_question') return 0.24;
-    if (style === 'condition_reminder') return 0.20;
+    if (style === 'concept_recall') return 0.20;
+    if (style === 'condition_reminder') return 0.18;
     return 0.12;
   }
 

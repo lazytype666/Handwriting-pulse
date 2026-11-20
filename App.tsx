@@ -2,18 +2,23 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { StatusBar, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import { InkCanvas, type Diagnostics, type InkCanvasHandle, type InkTool } from './src/capture';
+import {
+  InkCanvas,
+  type Diagnostics,
+  type InkCanvasHandle,
+  type InkTool,
+  type Stroke,
+} from './src/capture';
 import {
   HandwritingPulseEngine,
-  loadPersistedProfile,
-  savePersistedProfile,
+  type AnnotationLabel,
   type CompanionMode,
   type EngineDiagnosticsTick,
-  type PersistedUserProfile,
 } from './src/engine';
 import { copyToFolder, saveSnapshot } from './src/export';
 import { useHints } from './src/hints';
 import { DEFAULT_THRESHOLDS, type StallEvent } from './src/stalls';
+import { AnnotationCapsule } from './src/ui/AnnotationCapsule';
 import { ActionButton } from './src/ui/Controls';
 import { DiagnosticsPanel } from './src/ui/DiagnosticsPanel';
 import { ExportDialog, type ExportResult } from './src/ui/ExportDialog';
@@ -23,6 +28,10 @@ import { QuestionEditor } from './src/ui/QuestionEditor';
 
 function describeError(error: unknown) {
   return error instanceof Error ? error.message : '请检查可用存储空间后重试。';
+}
+
+function countTotalAnnotations(counts: Record<AnnotationLabel, number>): number {
+  return Object.values(counts).reduce((sum, n) => sum + n, 0);
 }
 
 export default function App() {
@@ -56,18 +65,18 @@ function Workspace() {
   const [cognitiveTick, setCognitiveTick] = useState<EngineDiagnosticsTick | null>(null);
   const [companionMode, setCompanionMode] = useState<CompanionMode>('socratic');
   const [learnedCount, setLearnedCount] = useState<number>(0);
+  const [totalAnnotations, setTotalAnnotations] = useState<number>(0);
   const [thresholds, setThresholds] = useState(DEFAULT_THRESHOLDS);
   const [tool, setTool] = useState<InkTool>('pen');
   const [question, setQuestion] = useState('');
   const [view, setView] = useState<'question' | 'history' | null>(null);
   const [events, setEvents] = useState<StallEvent[]>([]);
 
-  // 1. 初始化加载本地持久化运动指纹与个性化权重
+  // 1. 初始化加载本地持久化运动指纹、个性化权重与预温题干图谱缓存
   useEffect(() => {
     let active = true;
-    void loadPersistedProfile().then((profile: PersistedUserProfile | null) => {
+    void engineRef.current.bootstrapStorage().then(profile => {
       if (!active || !profile) return;
-      engineRef.current.hydrateProfile(profile);
       setCompanionMode(engineRef.current.getCompanionMode());
       setLearnedCount(engineRef.current.getPolicySnapshot().feedbackCount);
     });
@@ -76,16 +85,14 @@ function Workspace() {
     };
   }, []);
 
+  const syncAnnotationCounter = useCallback(() => {
+    setTotalAnnotations(countTotalAnnotations(engineRef.current.getAnnotationCounts()));
+  }, []);
+
   const onFeedbackPersist = useCallback(() => {
-    const raw = engineRef.current.exportPersistedProfile();
-    setLearnedCount(raw.policy.feedbackCount);
-    const persisted: PersistedUserProfile = {
-      version: 1,
-      updatedAt: Date.now(),
-      fingerprint: raw.fingerprint,
-      policy: raw.policy,
-    };
-    void savePersistedProfile(persisted);
+    const profile = engineRef.current.exportPersistedProfile();
+    setLearnedCount(profile.policy.feedbackCount);
+    void engineRef.current.persistAllState();
   }, []);
 
   const { current, advance, dismiss, dismissWithThinking, trigger } = useHints(
@@ -97,12 +104,55 @@ function Workspace() {
   const onStall = useCallback(
     (event: StallEvent) => {
       setEvents(previous => [...previous, event]);
-      trigger(event);
+      trigger(event, undefined, engineRef.current.getSuggestedHintLevel());
     },
     [trigger],
   );
 
-  // 2. 诊断采样驱动端侧连续状态机微分更新与隐式反馈收集
+  // 2. 笔迹落笔完成 / 撤销事件实时进入双流神经语法编码器与因果认知状态网络
+  const onStrokeComplete = useCallback(
+    (stroke: Stroke) => {
+      void engineRef.current.onStrokeComplete(stroke).then(() => {
+        syncAnnotationCounter();
+        setCognitiveTick(prev =>
+          prev
+            ? {
+                ...prev,
+                cognitiveState: engineRef.current.getCognitiveState(),
+                suggestedHintLevel: engineRef.current.getSuggestedHintLevel(),
+              }
+            : {
+                cognitiveState: engineRef.current.getCognitiveState(),
+                interventionThreshold: 0.62,
+                cognitiveStallEvent: null,
+                suggestedHintLevel: engineRef.current.getSuggestedHintLevel(),
+                settledFeedback: null,
+              },
+        );
+      });
+    },
+    [syncAnnotationCounter],
+  );
+
+  const onStrokeUndo = useCallback(
+    (stroke: Stroke) => {
+      void engineRef.current.onStrokeUndo(stroke).then(() => {
+        syncAnnotationCounter();
+        setCognitiveTick(prev =>
+          prev
+            ? {
+                ...prev,
+                cognitiveState: engineRef.current.getCognitiveState(),
+                suggestedHintLevel: engineRef.current.getSuggestedHintLevel(),
+              }
+            : null,
+        );
+      });
+    },
+    [syncAnnotationCounter],
+  );
+
+  // 3. 诊断采样驱动端侧连续状态机微分更新、自适应traj采样与隐式反馈闭环
   const onDiagnostics = useCallback(
     (data: Diagnostics) => {
       setDiagnostics(data);
@@ -110,17 +160,29 @@ function Workspace() {
       const tick = engine.processDiagnosticsTick(data, thresholds);
       setCognitiveTick(tick);
 
-      // 若状态机判定严重思维阻滞且满足介入条件，自动触发提示
       if (tick.cognitiveStallEvent) {
         onStall(tick.cognitiveStallEvent);
       }
 
-      // 若 5 秒隐式闭环产生反馈，持久化更新至本地
       if (tick.settledFeedback) {
         onFeedbackPersist();
+        syncAnnotationCounter();
       }
     },
-    [thresholds, onStall, onFeedbackPersist],
+    [thresholds, onStall, onFeedbackPersist, syncAnnotationCounter],
+  );
+
+  const handleCompanionAnnotate = useCallback(
+    (action: 'DEEP_THINKING_HOLD' | 'STUCK_CONCEPT_GAP' | 'STUCK_CALCULATION') => {
+      const outcome = engineRef.current.recordCompanionAnnotation(action);
+      syncAnnotationCounter();
+      onFeedbackPersist();
+      if (outcome.triggerEvent) {
+        setEvents(previous => [...previous, outcome.triggerEvent!]);
+        trigger(outcome.triggerEvent, outcome.preferredStyle);
+      }
+    },
+    [syncAnnotationCounter, onFeedbackPersist, trigger],
   );
 
   async function exportInk() {
@@ -129,11 +191,19 @@ function Workspace() {
     setSaving(true);
     try {
       const { strokes, stallEvents } = await canvas.current.snapshot();
+      const summary = engineRef.current.getSummary();
       const receipt = await saveSnapshot(strokes, stallEvents, {
-        cognitiveState: cognitiveTick?.cognitiveState,
-        companionMode,
-        policy: engineRef.current.getPolicySnapshot(),
+        problemId: summary.problemId,
+        problemText: question,
+        annotations: summary.annotations,
+        stateTrace: summary.stateTrace,
+        cognitiveState: summary.latestState,
+        latestSyntax: summary.latestSyntax,
+        companionMode: summary.companionMode,
+        policy: summary.policySnapshot,
+        feedbackLogs: summary.feedbackLogs,
       });
+      void engineRef.current.persistAllState();
       setResult({ kind: 'saved', receipt });
     } catch (error) {
       setResult({ kind: 'error', message: describeError(error) });
@@ -189,6 +259,8 @@ function Workspace() {
           thresholds={thresholds}
           onStall={onStall}
           onDiagnostics={onDiagnostics}
+          onStrokeComplete={onStrokeComplete}
+          onStrokeUndo={onStrokeUndo}
         />
         <DiagnosticsPanel
           data={diagnostics}
@@ -208,6 +280,11 @@ function Workspace() {
             setCompanionMode(engineRef.current.getCompanionMode());
             onFeedbackPersist();
           }}
+        />
+        <AnnotationCapsule
+          onAnnotate={handleCompanionAnnotate}
+          totalAnnotations={totalAnnotations}
+          compact={width < 460}
         />
         {current && (
           <View
@@ -262,6 +339,7 @@ function Workspace() {
         <HistoryView
           events={events}
           policySnapshot={engineRef.current.getPolicySnapshot()}
+          annotationCounts={engineRef.current.getAnnotationCounts()}
           onClose={() => setView(null)}
         />
       )}

@@ -19,6 +19,9 @@ export interface HintRequest {
   level: HintLevel;
   durationMs: number;
   style?: HintStyle;
+  recognizedLatex?: string;
+  matchedStepIndex?: number;
+  pitfallWarning?: string;
 }
 
 export interface HintResult {
@@ -80,6 +83,10 @@ export async function getHint(request: HintRequest, signal?: AbortSignal): Promi
                 目标层级: 'L' + request.level,
                 提示要求: levelInstructions[request.level],
                 ...(request.style ? { 风格要求: styleInstructions[request.style] } : {}),
+                ...(request.recognizedLatex ? { 局部识别算式: request.recognizedLatex } : {}),
+                ...(request.matchedStepIndex !== undefined && request.matchedStepIndex >= 0
+                  ? { 疑卡步骤序号: request.matchedStepIndex + 1 }
+                  : {}),
               }),
             },
           ],

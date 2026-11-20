@@ -1,10 +1,11 @@
 import type { HintStyle } from '../engine/personalizedPolicy';
 
-export type HintLevel = 1 | 2 | 3;
+export type HintLevel = 0 | 1 | 2 | 3;
 
 export const TIMEOUT_MS = 8000;
 
 export const levelInstructions: Record<HintLevel, string> = {
+  0: '用不超过十五字发出极简微提醒（如核对负号或定义域），绝不中断思路。',
   1: '只给一个值得观察的条件或方向。',
   2: '指出现在可以动手做的一个具体小步骤，留出推导空间。',
   3: '用两三句串起解题思路的主线，省略演算、证明细节和最终结果。',
@@ -15,6 +16,8 @@ export const styleInstructions: Record<HintStyle, string> = {
   condition_reminder: '风格【条件提醒】：优先提醒学生关注题干里尚未用上的关键已知条件或约束范围。',
   algebra_check: '风格【算式纠错】：优先提醒学生核对变形细节、正负号、边界或定义域是否遗漏。',
   step_decompose: '风格【拆步引导】：把当前卡住的复杂推导拆解成更小、更容易下笔的过渡目标。',
+  concept_recall: '风格【概念唤醒】：用一句话唤醒高数/线代/概率中的关联核心定理、性质或公式结构。',
+  sanity_check: '风格【特值自检】：引导学生用特值、极限边界、量纲或正交内积快速验算当前式子是否合理。',
 };
 
 export const systemMessage = [

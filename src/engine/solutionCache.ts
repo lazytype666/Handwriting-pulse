@@ -24,6 +24,7 @@ export interface SolutionPitfallSpec {
 }
 
 export interface StyleHintTiers {
+  l0?: string;
   l1?: string;
   l2?: string;
   l3?: string;
@@ -46,13 +47,20 @@ export function normalizeProblemKey(text: string): string {
 }
 
 /**
- * 本地离线多风格分层提示库（无网/无题干/超时降级时保证 4 种风格全部可用，且默认反问风格保留阶段二原文）。
+ * 本地离线多风格四层提示库（涵盖 L0 微轻推 与 6 种大学数学启发风格）。
  */
 export function getOfflineStyledHint(
   type: StallType,
   level: HintLevel,
   style: HintStyle = 'socratic_question',
 ): string {
+  if (level === 0) {
+    if (style === 'algebra_check') return '微提醒：留意一下这一步的正负号与系数。';
+    if (style === 'sanity_check') return '微提醒：代个特值或零点快速心算检验一下。';
+    if (style === 'condition_reminder') return '微提醒：检查题干约束边界用全了吗？';
+    return '微提醒：稳住当前节奏，小步顺推即可。';
+  }
+
   if (style === 'socratic_question') {
     if (level === 3) return '还是没思路的话，先标记这道题，休息几分钟再回来看。';
     if (level === 2) return '试着把当前这一步拆成更小的目标，一步一步来。';
@@ -77,6 +85,18 @@ export function getOfflineStyledHint(
     return '检查高次项系数是否为零、分母与定义域边界是否遗漏讨论，确认无误再往下推。';
   }
 
+  if (style === 'concept_recall') {
+    if (level === 1) return '先别急着硬算，回忆这一章对应定理成立的核心前提是什么？';
+    if (level === 2) return '想想高数/线代/概率中联系题设与目标的那条核心恒等式或正交性质。';
+    return '把题干特征与教科书标准定理对齐：先确定方法模型（如泰勒展开/增广秩/贝叶斯），再动手变形。';
+  }
+
+  if (style === 'sanity_check') {
+    if (level === 1) return '暂停检查一下当前表达式的极限趋势或特殊值（如取 0 或 1），结果合理吗？';
+    if (level === 2) return '对照一下行列式零点或概率总和归一项，看看刚才的变形有没有漏项或反号。';
+    return '利用临界点检验、奇偶对称性或矩阵正交内积快速自查上一步推导后再继续。';
+  }
+
   if (level === 1) return '这一步跨度有些大，能不能先在中间插一个更小的过渡目标？';
   if (level === 2) return '试着把当前这一步拆成更小的目标，先写最确定的一半。';
   return '把大问题拆成“先求中间量 → 再代回原式”两小段，先只完成第一段推导。';
@@ -96,6 +116,28 @@ export class SolutionCacheManager {
     return Boolean(entry && Object.keys(entry.hintsByStyle).length > 0);
   }
 
+  public getEntry(problemText: string): SolutionCacheEntry | null {
+    const key = normalizeProblemKey(problemText);
+    if (!key) return null;
+    return this.entries.get(key) ?? null;
+  }
+
+  public preloadEntry(entry: SolutionCacheEntry): void {
+    const key = normalizeProblemKey(entry.problemText || entry.problemKey);
+    if (!key) return;
+    if (!this.entries.has(key)) {
+      this.entries.set(key, { ...entry, problemKey: key });
+    }
+  }
+
+  public hydrateEntries(entries: SolutionCacheEntry[]): void {
+    for (const entry of entries) {
+      if (entry && typeof entry.problemText === 'string') {
+        this.preloadEntry(entry);
+      }
+    }
+  }
+
   public lookupHint(
     problemText: string,
     level: HintLevel,
@@ -108,7 +150,7 @@ export class SolutionCacheManager {
 
     const tiers = entry.hintsByStyle[style] ?? entry.hintsByStyle.socratic_question;
     if (!tiers) return null;
-    const text = level === 1 ? tiers.l1 : level === 2 ? tiers.l2 : tiers.l3;
+    const text = level === 0 ? tiers.l0 : level === 1 ? tiers.l1 : level === 2 ? tiers.l2 : tiers.l3;
     if (!text) return null;
     return { text, sourceMode: entry.sourceMode };
   }
@@ -132,7 +174,8 @@ export class SolutionCacheManager {
       updatedAt: Date.now(),
     };
     const tiers = existing.hintsByStyle[style] ?? {};
-    if (level === 1) tiers.l1 = hintText;
+    if (level === 0) tiers.l0 = hintText;
+    else if (level === 1) tiers.l1 = hintText;
     else if (level === 2) tiers.l2 = hintText;
     else tiers.l3 = hintText;
     existing.hintsByStyle[style] = tiers;
@@ -142,16 +185,34 @@ export class SolutionCacheManager {
 
   public async prewarm(problemText: string): Promise<SolutionCacheEntry | null> {
     const key = normalizeProblemKey(problemText);
-    const base = process.env.EXPO_PUBLIC_LLM_BASE_URL?.trim().replace(/\/+$/, '');
-    const apiKey = process.env.EXPO_PUBLIC_LLM_API_KEY?.trim();
-    const model = process.env.EXPO_PUBLIC_LLM_MODEL?.trim();
-    if (!key || !base || !apiKey || !model) return null;
+    if (!key) return null;
     if (this.hasPrewarmed(key)) return this.entries.get(key) ?? null;
 
+    const cloudBase = process.env.EXPO_PUBLIC_LLM_BASE_URL?.trim().replace(/\/+$/, '');
+    const cloudKey = process.env.EXPO_PUBLIC_LLM_API_KEY?.trim();
+    const cloudModel = process.env.EXPO_PUBLIC_LLM_MODEL?.trim();
+
+    const edgeBase = process.env.EXPO_PUBLIC_EDGE_LLM_URL?.trim().replace(/\/+$/, '');
+    const edgeModel = process.env.EXPO_PUBLIC_EDGE_LLM_MODEL?.trim() || 'qwen2.5-math-1.5b';
+
+    const useCloud = Boolean(cloudBase && cloudKey && cloudModel);
+    const useEdge = !useCloud && Boolean(edgeBase);
+    if (!useCloud && !useEdge) return null;
+
+    const base = useCloud ? cloudBase! : edgeBase!;
+    const model = useCloud ? cloudModel! : edgeModel;
     const inflight = this.inflightPrewarm.get(key);
     if (inflight) return inflight;
 
-    const endpoint = base.endsWith('/chat/completions') ? base : base + '/chat/completions';
+    const endpoint = base.endsWith('/chat/completions')
+      ? base
+      : useCloud
+        ? base + '/chat/completions'
+        : base + '/v1/chat/completions';
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(useCloud && cloudKey ? { Authorization: 'Bearer ' + cloudKey } : {}),
+    };
     const task = (async () => {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -159,16 +220,18 @@ export class SolutionCacheManager {
         const styleList = HINT_STYLES.map(s => `${s}(${HINT_STYLE_LABELS[s]})`).join('、');
         const userPrompt = [
           `题干：${problemText.trim()}`,
-          `请为该题生成结构化解题图谱 JSON（仅返回纯 JSON，不要代码块标记）：包含主干步骤 steps、易错歧路 commonPitfalls、以及 ${styleList} 四种风格的 l1/l2/l3 提示。`,
-          '每条 l1/l2/l3 严格遵守老师提示规则：引用题干关键词，用普通文本表达数学式，绝不出现最终答案或完整过程。',
+          `请为该题生成结构化解题图谱 JSON（仅返回纯 JSON，不要代码块标记）：包含主干步骤 steps、易错歧路 commonPitfalls、以及 ${styleList} 六种风格的 l0/l1/l2/l3 提示。`,
+          '每条 l0(15字内微提醒)/l1/l2/l3 严格遵守老师提示规则：引用题干关键词，用普通文本表达数学式，绝不出现最终答案或完整过程。',
           JSON.stringify({
             steps: [{ stepIndex: 1, goalDescription: '步骤目标', expectedTokens: ['关键表达式'] }],
             commonPitfalls: [{ triggerPattern: '典型误区', warningHint: '温和反问' }],
             hintsByStyle: {
-              socratic_question: { l1: '...', l2: '...', l3: '...' },
-              condition_reminder: { l1: '...', l2: '...', l3: '...' },
-              algebra_check: { l1: '...', l2: '...', l3: '...' },
-              step_decompose: { l1: '...', l2: '...', l3: '...' },
+              socratic_question: { l0: '...', l1: '...', l2: '...', l3: '...' },
+              condition_reminder: { l0: '...', l1: '...', l2: '...', l3: '...' },
+              algebra_check: { l0: '...', l1: '...', l2: '...', l3: '...' },
+              step_decompose: { l0: '...', l1: '...', l2: '...', l3: '...' },
+              concept_recall: { l0: '...', l1: '...', l2: '...', l3: '...' },
+              sanity_check: { l0: '...', l1: '...', l2: '...', l3: '...' },
             },
           }),
         ].join('\n\n');
@@ -176,7 +239,7 @@ export class SolutionCacheManager {
         const response = await fetch(endpoint, {
           method: 'POST',
           signal: controller.signal,
-          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + apiKey },
+          headers,
           body: JSON.stringify({
             model,
             stream: false,
@@ -199,11 +262,13 @@ export class SolutionCacheManager {
         for (const style of HINT_STYLES) {
           const tiers = parsed.hintsByStyle?.[style];
           if (!tiers) continue;
+          const l0 = filterSafeHintText(tiers.l0);
           const l1 = filterSafeHintText(tiers.l1);
           const l2 = filterSafeHintText(tiers.l2);
           const l3 = filterSafeHintText(tiers.l3);
-          if (l1 || l2 || l3) {
+          if (l0 || l1 || l2 || l3) {
             sanitizedStyles[style] = {
+              ...(l0 ? { l0 } : {}),
               ...(l1 ? { l1 } : {}),
               ...(l2 ? { l2 } : {}),
               ...(l3 ? { l3 } : {}),
@@ -219,7 +284,7 @@ export class SolutionCacheManager {
           commonPitfalls: Array.isArray(parsed.commonPitfalls) ? parsed.commonPitfalls : [],
           hintsByStyle: sanitizedStyles,
           sealedFinalAnswer: parsed.sealedFinalAnswer,
-          sourceMode: 'cloud_prewarm',
+          sourceMode: useEdge ? 'edge_offline' : 'cloud_prewarm',
           updatedAt: Date.now(),
         };
         this.entries.set(key, entry);

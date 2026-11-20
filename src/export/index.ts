@@ -7,6 +7,7 @@ export interface ExportReceipt {
   strokeCount: number;
   pointCount: number;
   stallCount: number;
+  annotationCount?: number;
 }
 
 let sequence = 0;
@@ -28,16 +29,37 @@ async function nextFileUri(date: Date): Promise<string> {
 export async function saveSnapshot(
   strokes: Stroke[],
   stallEvents: StallEvent[] = [],
-  cognitiveSession?: Record<string, unknown>,
+  cognitiveSession?: {
+    problemId?: string;
+    problemText?: string;
+    annotations?: unknown[];
+    stateTrace?: unknown[];
+    [key: string]: unknown;
+  },
 ): Promise<ExportReceipt> {
   const now = new Date();
   const strokeCount = strokes.length;
   const pointCount = strokes.reduce((sum, stroke) => sum + stroke.points.length, 0);
+  const annotations = Array.isArray(cognitiveSession?.annotations)
+    ? cognitiveSession.annotations
+    : undefined;
+  const stateTrace = Array.isArray(cognitiveSession?.stateTrace)
+    ? cognitiveSession.stateTrace
+    : undefined;
+
   const data = JSON.stringify({
-    meta: { exportedAt: now.toISOString(), strokeCount, pointCount },
+    meta: {
+      exportedAt: now.toISOString(),
+      strokeCount,
+      pointCount,
+      ...(cognitiveSession ? { version: '2.0-annotated' } : {}),
+      ...(cognitiveSession?.problemId ? { problemId: cognitiveSession.problemId } : {}),
+    },
     strokes,
     stallEvents,
-    cognitiveSession,
+    ...(annotations ? { annotations } : {}),
+    ...(stateTrace ? { stateTrace } : {}),
+    ...(cognitiveSession ? { cognitiveSession } : {}),
   });
   const uri = await nextFileUri(now);
   const pending = uri + '.part';
@@ -49,7 +71,13 @@ export async function saveSnapshot(
     await FileSystem.deleteAsync(pending, { idempotent: true }).catch(() => {});
     throw error;
   }
-  return { uri, strokeCount, pointCount, stallCount: stallEvents.length };
+  return {
+    uri,
+    strokeCount,
+    pointCount,
+    stallCount: stallEvents.length,
+    ...(annotations ? { annotationCount: annotations.length } : {}),
+  };
 }
 
 export async function copyToFolder(receipt: ExportReceipt): Promise<string | null> {

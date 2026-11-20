@@ -22,10 +22,10 @@ export function HintCard({ current, advance, dismiss, dismissWithThinking }: Pro
           : '正在请求';
 
   return (
-    <View style={styles.card}>
+    <View style={[styles.card, current.level === 0 && styles.nudgeCard]}>
       <View style={styles.header}>
         <Text style={styles.title}>
-          L{current.level} · {STALL_LABEL[current.type]}{styleTag}
+          {current.level === 0 ? '微轻推 L0' : `L${current.level}`} · {STALL_LABEL[current.type]}{styleTag}
         </Text>
         <Text style={styles.source}>{sourceLabel}</Text>
       </View>
@@ -37,7 +37,7 @@ export function HintCard({ current, advance, dismiss, dismissWithThinking }: Pro
         <ActionButton label="收起" onPress={dismiss} />
         {current.level < 3 && (
           <ActionButton
-            label="再提示一点"
+            label={current.level === 0 ? '展开 L1 思路' : '再提示一点'}
             primary
             onPress={advance}
             disabled={current.source === 'loading'}
@@ -60,6 +60,12 @@ const styles = StyleSheet.create({
     borderColor: '#b4c8bb',
     borderWidth: 1,
     borderRadius: 9,
+  },
+  nudgeCard: {
+    paddingVertical: 8,
+    paddingHorizontal: 11,
+    backgroundColor: '#f6faf8',
+    borderColor: '#cde0d6',
   },
   header: {
     flexDirection: 'row',

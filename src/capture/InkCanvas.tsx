@@ -19,6 +19,8 @@ interface InkCanvasProps {
   thresholds: Thresholds;
   onStall: (event: StallEvent) => void;
   onDiagnostics: (diagnostics: Diagnostics) => void;
+  onStrokeComplete?: (stroke: Stroke) => void;
+  onStrokeUndo?: (stroke: Stroke) => void;
 }
 
 const PEN_WIDTH = 2.25;
@@ -48,7 +50,7 @@ function makeGeometry() {
 }
 
 export const InkCanvas = memo(forwardRef<InkCanvasHandle, InkCanvasProps>(
-  function InkCanvas({ tool, thresholds, onDiagnostics, onStall }, ref) {
+  function InkCanvas({ tool, thresholds, onDiagnostics, onStall, onStrokeComplete, onStrokeUndo }, ref) {
     const recorder = useSharedValue(createRecorder());
     const features = useSharedValue(createFeatures());
     const detector = useSharedValue(createDetector());
@@ -87,6 +89,16 @@ export const InkCanvas = memo(forwardRef<InkCanvasHandle, InkCanvasProps>(
       liveEraser.value = geometry.empty;
       dirty.value = false;
       refreshPicture();
+      if (onStrokeComplete && recorder.value.strokes.length > 0) {
+        const latest = recorder.value.strokes[recorder.value.strokes.length - 1];
+        if (latest.points.length > 0) {
+          scheduleOnRN(onStrokeComplete, {
+            id: latest.id,
+            ...(latest.tool ? { tool: latest.tool } : {}),
+            points: latest.points.map(point => ({ x: point.x, y: point.y, t: point.t })),
+          });
+        }
+      }
     };
 
     useImperativeHandle(ref, () => ({
@@ -106,8 +118,15 @@ export const InkCanvas = memo(forwardRef<InkCanvasHandle, InkCanvasProps>(
           features.value.erasePath = [];
         }
         refreshPicture();
+        if (onStrokeUndo) {
+          scheduleOnRN(onStrokeUndo, {
+            id: removed.id,
+            ...(removed.tool ? { tool: removed.tool } : {}),
+            points: removed.points.map(point => ({ x: point.x, y: point.y, t: point.t })),
+          });
+        }
       }),
-    }));
+    }), [onStrokeComplete, onStrokeUndo]);
 
     const sample = (down: boolean, x: number, y: number, absoluteX: number, absoluteY: number, now: number) => {
       'worklet';

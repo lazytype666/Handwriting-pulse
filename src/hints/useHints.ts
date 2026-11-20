@@ -58,8 +58,9 @@ export function useHints(
     (request: HintRequest) => {
       clear();
       const controller = new AbortController();
-      const style = request.style ?? engine?.selectStyleForStall(request.type);
-      const enriched: HintRequest = { ...request, style };
+      const style = engine ? engine.selectStyleForStall(request.type, request.style) : request.style;
+      const syntaxCtx = engine?.getSyntaxContextForHint() ?? {};
+      const enriched: HintRequest = { ...request, ...syntaxCtx, style };
       active.current = { request: enriched, controller };
       const { type, level } = enriched;
 
@@ -111,8 +112,8 @@ export function useHints(
   );
 
   const trigger = useCallback(
-    ({ type, durationMs }: TriggerEvent) => {
-      show({ question, type, durationMs, level: 1 });
+    ({ type, durationMs }: TriggerEvent, preferredStyle?: HintStyle, initialLevel: HintLevel = 1) => {
+      show({ question, type, durationMs, level: initialLevel, style: preferredStyle });
     },
     [question, show],
   );
@@ -124,7 +125,9 @@ export function useHints(
         const entry = engine.recordExplicitFeedback('request_more');
         if (entry) onFeedbackRecorded?.();
       }
-      show({ ...previous, level: previous.level === 1 ? 2 : 3 });
+      const nextLevel: HintLevel =
+        previous.level === 0 ? 1 : previous.level === 1 ? 2 : 3;
+      show({ ...previous, level: nextLevel });
     }
   }, [engine, onFeedbackRecorded, show]);
 

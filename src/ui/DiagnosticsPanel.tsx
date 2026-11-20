@@ -3,6 +3,7 @@ import { Modal, Pressable, ScrollView, StyleSheet, Text, View, type GestureRespo
 import { SafeAreaView } from 'react-native-safe-area-context';
 import type { Diagnostics } from '../capture';
 import {
+  COGNITIVE_CATEGORY_ZH,
   COMPANION_MODE_LABELS,
   type CognitiveState,
   type CompanionMode,
@@ -116,9 +117,19 @@ export function DiagnosticsPanel({
               <Text style={styles.small}>触发　{data.lastStall ? STALL_LABEL[data.lastStall] : '无'}</Text>
               <Text style={styles.small}>冷却　{seconds(data.cooldownMs)}</Text>
               {cognitiveState && (
-                <Text style={styles.small}>
-                  动量/阻力　{cognitiveState.momentumM.toFixed(2)} / {cognitiveState.resistanceR.toFixed(2)}
-                </Text>
+                <>
+                  <Text style={styles.small}>
+                    状态　{COGNITIVE_CATEGORY_ZH[cognitiveState.cognitiveCategory]}（{cognitiveState.neuralMode === 'neural_ts' ? '神经网' : '启发式'}）
+                  </Text>
+                  <Text style={styles.small}>
+                    动量/阻力/对齐　{cognitiveState.momentumM.toFixed(2)} / {cognitiveState.resistanceR.toFixed(2)} / {cognitiveState.alignmentA.toFixed(2)}
+                  </Text>
+                  {!!cognitiveState.recognizedLatex && (
+                    <Text numberOfLines={1} style={styles.small}>
+                      语法　{cognitiveState.recognizedLatex}
+                    </Text>
+                  )}
+                </>
               )}
             </View>
           )}
@@ -146,10 +157,16 @@ export function DiagnosticsPanel({
                 {cognitiveState && (
                   <>
                     <Text style={styles.readout}>
+                      端侧分类　{COGNITIVE_CATEGORY_ZH[cognitiveState.cognitiveCategory]}（{cognitiveState.neuralMode === 'neural_ts' ? '双流量化权重' : '热身启发式'}）
+                    </Text>
+                    <Text style={styles.readout}>
                       认知状态 [M, R, A]　{cognitiveState.momentumM.toFixed(2)} / {cognitiveState.resistanceR.toFixed(2)} / {cognitiveState.alignmentA.toFixed(2)}
                     </Text>
                     <Text style={styles.readout}>
-                      干预倾向 P(t)　{cognitiveState.interventionScore.toFixed(2)} / 阈值 {(interventionThreshold ?? 0.62).toFixed(2)}
+                      干预倾向 P(t)　{cognitiveState.interventionScore.toFixed(2)} / 阈值 {(interventionThreshold ?? 0.62).toFixed(2)}（惊奇 S={cognitiveState.surpriseScore.toFixed(2)}）
+                    </Text>
+                    <Text style={styles.readout}>
+                      语法对齐　{cognitiveState.matchedStepIndex >= 0 ? `第 ${cognitiveState.matchedStepIndex + 1} 步` : '自由推导'} · {cognitiveState.recognizedLatex || '等待落笔'}
                     </Text>
                   </>
                 )}

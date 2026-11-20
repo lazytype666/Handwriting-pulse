@@ -1,6 +1,7 @@
 import type { Diagnostics, Stroke } from '../capture';
 import type { HintLevel } from '../hints/safety';
 import type { StallEvent, StallType, Thresholds } from '../stalls';
+import type { AnnotationRecord, StateTraceSample } from './annotationTracker';
 import type { CognitiveState, CompanionMode, MotorFingerprint } from './cognitiveState';
 import type { FeedbackLogEntry, FeedbackSignal, HintStyle, PolicySnapshot } from './personalizedPolicy';
 import type { SolutionCacheEntry } from './solutionCache';
@@ -47,9 +48,12 @@ export interface IStorageAdapter {
 
 export interface EngineSessionPayload {
   exportedAt: string;
+  problemId?: string;
   problemText: string;
   strokes: Stroke[];
   stallEvents: StallEvent[];
+  annotations?: AnnotationRecord[];
+  stateTrace?: StateTraceSample[];
   cognitiveSummary: {
     companionMode: CompanionMode;
     interventionThreshold: number;
@@ -65,11 +69,15 @@ export interface EngineDiagnosticsTick {
   cognitiveState: CognitiveState;
   interventionThreshold: number;
   cognitiveStallEvent: StallEvent | null;
+  suggestedHintLevel?: HintLevel;
   settledFeedback: FeedbackLogEntry | null;
 }
 
 export interface IHandwritingPulseEngine {
   updateProblemText(problemText: string): Promise<boolean>;
+  ingestProblemImageUri?(imageUri: string): Promise<string>;
+  onStrokeComplete?(stroke: Stroke): Promise<void>;
+  onStrokeUndo?(stroke: Stroke): Promise<void>;
   setCompanionMode(mode: CompanionMode): void;
   setSemanticAlignment(alignmentA: number): void;
   processDiagnosticsTick(
@@ -80,6 +88,7 @@ export interface IHandwritingPulseEngine {
   selectStyleForStall(type: StallType): HintStyle;
   recordExplicitFeedback(action: 'request_more' | 'dismiss' | 'thinking'): FeedbackLogEntry | null;
   registerEdgeModelAdapter(adapter: IEdgeHintModelAdapter | null): void;
+  registerSyntaxEncoderAdapter?(adapter: IInkSyntaxEncoderAdapter | null): void;
 }
 
 export type { FeedbackSignal, HintStyle, PolicySnapshot };

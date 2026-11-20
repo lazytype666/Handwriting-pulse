@@ -58,7 +58,14 @@ Expo 会把 `EXPO_PUBLIC_*` 写入客户端程序，持有 APK 的人可以从�
 }
 ```
 
-`strokes` 保留尚未撤销的绘制操作，按顺序回放即可重现画面。橡皮带有 `tool: "eraser"`。撤销恢复上一步画面，已观测到的卡壳事件仍留在历史里。事件包含 `id`、`type`（`pause_erase` 或 `speed_drop`）、`startedAt`、`x`、`y` 和 `durationMs`。后者在停顿涂改中代表停顿时长，在速度骤降中代表检测到的低速时长。
+`strokes` 保留尚未撤销的绘制操作，按顺序回放即可重现画面。橡皮带有 `tool: "eraser"`。撤销恢复上一步画面，已观测到的卡壳事件仍留在历史里。事件包含 `id`、`type`（`pause_erase`、`speed_drop` 或 `cognitive_stall`）、`startedAt`、`x`、`y` 和 `durationMs`。导出文件同时包含 `annotations`（伴随微标注标签如 `DEEP_THINKING_HOLD`、`SELF_CORRECTION`、`STUCK_CONCEPT_GAP`、`STUCK_CALCULATION`）与降采样 `stateTrace`（`[M, R, A]` 轨迹），标记为 `meta.version = "2.0-annotated"`，可用于 `ml/` 训练与消融验证。
+
+## 端侧高级认知引擎与离线模型管线
+
+- **题干图谱与大学数学示例库**：点「题干」可一键加载内置的 6 道带解题步骤树与歧路预警的大学数学例题（高数泰勒极限/变限积分/微分方程、线代含参方程组/实对称正交对角化、概率论全概率贝叶斯），断网环境即可立即测试毫秒级步骤匹配与歧路提醒。
+- **端侧全科笔迹语法编码 (`EdgeInkSyntaxEncoder`)**：每笔落笔完成后在端侧执行几何与二维布局聚类，覆盖高数（`\int`、`\oint`、`\sum`、`\prod`、`\partial`、`\nabla`、`\infty`、`\to`）、线代（跨行矩阵/行列式界定符、上下标 `^T`/`_{ij}`）与概率统计（`~`、`\Phi`、`\cap`、`\cup`、`\varnothing`、`\bar{X}` 上划线），识别逻辑连接边界并计算轨迹对齐度 $A(t)$ 与边界惊奇倍率；预留 `IInkSyntaxEncoderAdapter` 接口便于挂载 MathWriting ONNX 模型。
+- **零负担伴随微标注**：画布右上角悬浮轻量胶囊，支持一键标注「心算勿扰」（静默 8.5 秒防打扰）或主动选择「定理卡壳 / 算式受阻」，橡皮与撤销操作自动记入 `SELF_CORRECTION`。
+- **离线模型训练与评测 (`ml/`)**：提供空间-动力学解耦双流 PyTorch 网络（`ml/models/decoupled_dual_stream.py`）、`v2.0-annotated` 数据转换器与 ONNX 导出脚本。运行 `python ml/train/benchmark_baseline.py` 可复现固定阈值与双流融合模型的消融实验对比。
 
 ## 如何打包成 APK
 
@@ -110,8 +117,9 @@ Expo 会把 `EXPO_PUBLIC_*` 写入客户端程序，持有 APK 的人可以从�
 
 - `src/capture/` 使用开源 Gesture Handler、Reanimated 与 Worklets 在 UI 线程接收触点，以单调时钟映射 Unix 毫秒。Skia 绘图随帧刷新，采样与显示分开执行。
 - `src/stalls/` 的距离、速度滑窗、停顿与涂改匹配、冷却和事件分组由项目自研。界面使用 React Native 及开源 Safe Area Context 适配系统边缘。
-- `src/engine/` 端侧多源认知引擎由项目自研：构建三维连续认知状态空间 $s(t)=[M, R, A]$、个人运动指纹自适应、外环 7 维 LinUCB 个性化提示路由、解题图谱缓存与 5 秒书写恢复隐式反馈闭环。
-- `src/hints/` 管理本地分层提示、解题图谱缓存与兼容服务请求。在线内容由实际配置的模型服务生成。
+- `src/engine/` 端侧多源认知引擎由 [团队名称] 全自研实现：包含几何语法编码与步骤对齐 (`inkSyntaxEncoder.ts`)、连续认知状态机 $[M, R, A]$ 与个人运动指纹 (`cognitiveState.ts`)、7 维 LinUCB 提示路由 (`personalizedPolicy.ts`)、解题图谱缓存 (`solutionCache.ts` & `sampleProblems.ts`)、题干多模态/文本摄入 (`problemIngestor.ts`)、端侧提示合成 (`edgeHintModel.ts`) 及伴随微标注采集 (`annotationTracker.ts`)。
+- `src/hints/` 管理本地分层提示、防剧透校验与兼容服务请求。在线内容由实际配置的模型服务生成。
 - `src/export/` 使用开源 expo-file-system 写入本机文件，先写临时文件再改名，安卓另存使用系统目录选择器。
+- `ml/` 提供配套离线双流模型（PyTorch + ONNX 导出）与纯 CPU 基准评测流水线（基于 NumPy / scikit-learn）。
 
 从 `main` 创建分支，并用中文写明设备、输入动作及验证结果。[贡献指南](CONTRIBUTING.md) · [MIT 许可证](LICENSE)
