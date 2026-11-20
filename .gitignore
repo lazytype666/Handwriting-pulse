@@ -46,3 +46,8 @@ __pycache__/
 *.pyc
 *.pyo
 ml/runs/
+ml/real_data/
+ml/blind_audit/
+
+# 本地生成的协作/标注 Word 文档（不入 Git 仓库）
+docs/*.docx
