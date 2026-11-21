@@ -2,12 +2,31 @@
   "expo": {
     "name": "笔迹脉搏",
     "slug": "ink-pulse",
-    "description": "安卓数学草稿纸，按笔记录书写，检测停顿涂改和速度骤降，提供分层提示并支持本地回看与导出。",
-    "version": "1.1.0",
+    "scheme": "inkpulse",
+    "description": "安卓数学草稿纸，按笔记录书写，检测停顿涂改和速度骤降，支持拍照识题、分层提示、本地回看与导出。",
+    "version": "1.2.0",
     "android": {
       "package": "app.inkpulse.notebook",
-      "versionCode": 2
+      "versionCode": 3,
+      "permissions": ["android.permission.CAMERA"]
     },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "允许笔迹脉搏读取照片以识别题目。",
+          "cameraPermission": "允许笔迹脉搏拍照识别题目。",
+          "microphonePermission": false
+        }
+      ],
+      [
+        "rn-mlkit-ocr",
+        {
+          "ocrModels": ["chinese", "latin"],
+          "ocrUseBundled": true
+        }
+      ]
+    ],
     "platforms": ["android"],
     "orientation": "default",
     "userInterfaceStyle": "light"
