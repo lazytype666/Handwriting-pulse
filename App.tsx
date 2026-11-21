@@ -4,6 +4,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import {
   InkCanvas,
+  type CanvasHistory,
   type Diagnostics,
   type InkCanvasHandle,
   type InkTool,
@@ -19,6 +20,7 @@ import { copyToFolder, saveSnapshot } from './src/export';
 import { useHints } from './src/hints';
 import { DEFAULT_THRESHOLDS, type StallEvent } from './src/stalls';
 import { AnnotationCapsule } from './src/ui/AnnotationCapsule';
+import { ConfirmDialog } from './src/ui/ConfirmDialog';
 import { ActionButton } from './src/ui/Controls';
 import { DiagnosticsPanel } from './src/ui/DiagnosticsPanel';
 import { ExportDialog, type ExportResult } from './src/ui/ExportDialog';
@@ -68,6 +70,11 @@ function Workspace() {
   const [totalAnnotations, setTotalAnnotations] = useState<number>(0);
   const [thresholds, setThresholds] = useState(DEFAULT_THRESHOLDS);
   const [tool, setTool] = useState<InkTool>('pen');
+  const [history, setHistory] = useState<CanvasHistory>({
+    canUndo: false,
+    canRedo: false,
+  });
+  const [confirmingClear, setConfirmingClear] = useState(false);
   const [question, setQuestion] = useState('');
   const [view, setView] = useState<'question' | 'history' | null>(null);
   const [events, setEvents] = useState<StallEvent[]>([]);
@@ -75,7 +82,7 @@ function Workspace() {
   // 1. 初始化加载本地持久化运动指纹、个性化权重与预温题干图谱缓存
   useEffect(() => {
     let active = true;
-    void engineRef.current.bootstrapStorage().then(profile => {
+    void engineRef.current.bootstrapStorage().then((profile) => {
       if (!active || !profile) return;
       setCompanionMode(engineRef.current.getCompanionMode());
       setLearnedCount(engineRef.current.getPolicySnapshot().feedbackCount);
@@ -103,7 +110,7 @@ function Workspace() {
 
   const onStall = useCallback(
     (event: StallEvent) => {
-      setEvents(previous => [...previous, event]);
+      setEvents((previous) => [...previous, event]);
       trigger(event, undefined, engineRef.current.getSuggestedHintLevel());
     },
     [trigger],
@@ -114,7 +121,7 @@ function Workspace() {
     (stroke: Stroke) => {
       void engineRef.current.onStrokeComplete(stroke).then(() => {
         syncAnnotationCounter();
-        setCognitiveTick(prev =>
+        setCognitiveTick((prev) =>
           prev
             ? {
                 ...prev,
@@ -138,7 +145,7 @@ function Workspace() {
     (stroke: Stroke) => {
       void engineRef.current.onStrokeUndo(stroke).then(() => {
         syncAnnotationCounter();
-        setCognitiveTick(prev =>
+        setCognitiveTick((prev) =>
           prev
             ? {
                 ...prev,
@@ -178,7 +185,7 @@ function Workspace() {
       syncAnnotationCounter();
       onFeedbackPersist();
       if (outcome.triggerEvent) {
-        setEvents(previous => [...previous, outcome.triggerEvent!]);
+        setEvents((previous) => [...previous, outcome.triggerEvent!]);
         trigger(outcome.triggerEvent, outcome.preferredStyle);
       }
     },
@@ -240,10 +247,7 @@ function Workspace() {
           笔迹脉搏
         </Text>
         <View style={styles.topActions}>
-          <ActionButton
-            label={question ? '查看题干' : '题干'}
-            onPress={() => setView('question')}
-          />
+          <ActionButton label={question ? '查看题干' : '题干'} onPress={() => setView('question')} />
           <ActionButton label="历史" onPress={() => setView('history')} />
         </View>
         {width >= 600 && !!question && (
@@ -261,6 +265,7 @@ function Workspace() {
           onDiagnostics={onDiagnostics}
           onStrokeComplete={onStrokeComplete}
           onStrokeUndo={onStrokeUndo}
+          onHistory={setHistory}
         />
         <DiagnosticsPanel
           data={diagnostics}
@@ -270,7 +275,7 @@ function Workspace() {
           interventionThreshold={cognitiveTick?.interventionThreshold}
           companionMode={companionMode}
           learnedCount={learnedCount}
-          onChangeCompanionMode={mode => {
+          onChangeCompanionMode={(mode) => {
             engineRef.current.setCompanionMode(mode);
             setCompanionMode(mode);
             onFeedbackPersist();
@@ -287,32 +292,34 @@ function Workspace() {
           compact={width < 460}
         />
         {current && (
-          <View
-            pointerEvents="box-none"
-            style={[styles.hintSpace, { maxHeight: height < 400 ? '94%' : '68%' }]}
-          >
-            <HintCard
-              current={current}
-              advance={advance}
-              dismiss={dismiss}
-              dismissWithThinking={dismissWithThinking}
-            />
+          <View pointerEvents="box-none" style={[styles.hintSpace, { maxHeight: height < 400 ? '94%' : '68%' }]}>
+            <HintCard current={current} advance={advance} dismiss={dismiss} dismissWithThinking={dismissWithThinking} />
           </View>
         )}
       </View>
       <View style={styles.toolbar}>
         <View style={styles.tools}>
           <ActionButton label="笔" selected={tool === 'pen'} onPress={() => setTool('pen')} />
-          <ActionButton
-            label="橡皮"
-            selected={tool === 'eraser'}
-            onPress={() => setTool('eraser')}
-          />
+          <ActionButton label="橡皮" selected={tool === 'eraser'} onPress={() => setTool('eraser')} />
           <ActionButton
             label="撤销"
+            disabled={!history.canUndo}
             onPress={() => {
               void canvas.current?.undo();
             }}
+          />
+          <ActionButton
+            label="重做"
+            disabled={!history.canRedo}
+            onPress={() => {
+              void canvas.current?.redo();
+            }}
+          />
+          <ActionButton
+            label="清空"
+            accessibilityLabel="清空画布"
+            disabled={!history.canUndo}
+            onPress={() => setConfirmingClear(true)}
           />
         </View>
         <ActionButton
@@ -327,7 +334,7 @@ function Workspace() {
         <QuestionEditor
           question={question}
           onClose={() => setView(null)}
-          onSave={value => {
+          onSave={(value) => {
             if (value !== question) dismiss();
             setQuestion(value);
             setView(null);
@@ -341,6 +348,23 @@ function Workspace() {
           policySnapshot={engineRef.current.getPolicySnapshot()}
           annotationCounts={engineRef.current.getAnnotationCounts()}
           onClose={() => setView(null)}
+        />
+      )}
+      {confirmingClear && (
+        <ConfirmDialog
+          title="清空画布？"
+          message="画布上的笔迹会被清除，清空后不可撤销。本次卡壳历史会保留，并可继续导出；认知状态与微标注会随画布一起重置。"
+          confirmLabel="清空"
+          destructive
+          onConfirm={() => {
+            setConfirmingClear(false);
+            dismiss();
+            void canvas.current?.clear();
+            engineRef.current.resetSessionTracking();
+            setCognitiveTick(null);
+            syncAnnotationCounter();
+          }}
+          onCancel={() => setConfirmingClear(false)}
         />
       )}
       {result && (
