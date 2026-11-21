@@ -1,7 +1,7 @@
 {
   "name": "ink-pulse",
-  "version": "1.1.0",
-  "description": "安卓数学草稿纸，按笔记录轨迹、检测停顿涂改与速度骤降，提供分层提示并导出会话记录。",
+  "version": "1.2.0",
+  "description": "安卓数学草稿纸，按笔记录轨迹、检测停顿涂改与速度骤降，支持拍照识题、分层提示与导出会话记录。",
   "license": "MIT",
   "private": true,
   "main": "index.ts",
@@ -11,21 +11,29 @@
   "scripts": {
     "start": "expo start --go",
     "android": "expo start --go --android",
+    "start:dev": "expo start --dev-client",
+    "android:dev": "expo start --dev-client --android",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@shopify/react-native-skia": "2.14.0",
     "expo": "58.0.26",
+    "expo-constants": "~58.0.16",
+    "expo-dev-client": "~58.0.21",
     "expo-file-system": "~58.0.14",
+    "expo-image-manipulator": "~58.0.16",
+    "expo-image-picker": "~58.0.10",
     "react": "19.3.0",
     "react-native": "0.88.1",
     "react-native-gesture-handler": "~3.3.0",
     "react-native-reanimated": "4.7.1",
     "react-native-safe-area-context": "~5.11.1",
-    "react-native-worklets": "0.13.0"
+    "react-native-worklets": "0.13.0",
+    "rn-mlkit-ocr": "^0.3.1"
   },
   "devDependencies": {
     "@types/react": "~19.3.0",
+    "prettier": "^3.10.1",
     "typescript": "~6.0.3"
   }
 }
