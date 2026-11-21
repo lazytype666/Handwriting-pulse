@@ -28,14 +28,25 @@ async function pick(source: OcrSource): Promise<Picked | null> {
   if (source === 'camera') {
     const permission = await ImagePicker.requestCameraPermissionsAsync();
     if (!permission.granted) throw permissionError(permission, '相机');
-    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.85, exif: false });
+    const result = await ImagePicker.launchCameraAsync({
+      mediaTypes: ['images'],
+      quality: 0.85,
+      exif: false,
+      // Android 使用内置裁剪界面；不传 aspect 时保持自由比例，便于框选题目区域。
+      allowsEditing: true,
+    });
     if (result.canceled) return null;
     const asset = result.assets[0];
     return asset ? { uri: asset.uri, width: asset.width, height: asset.height } : null;
   }
   const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
   if (!permission.granted) throw permissionError(permission, '照片');
-  const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.85, exif: false });
+  const result = await ImagePicker.launchImageLibraryAsync({
+    mediaTypes: ['images'],
+    quality: 0.85,
+    exif: false,
+    allowsEditing: true,
+  });
   if (result.canceled) return null;
   const asset = result.assets[0];
   return asset ? { uri: asset.uri, width: asset.width, height: asset.height } : null;
