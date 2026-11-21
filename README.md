@@ -58,7 +58,38 @@ Expo 会把 `EXPO_PUBLIC_*` 写入客户端程序，持有 APK 的人可以从�
 }
 ```
 
-`strokes` 保留尚未撤销的绘制操作，按顺序回放即可重现画面。橡皮带有 `tool: "eraser"`。撤销恢复上一步画面，已观测到的卡壳事件仍留在历史里。事件包含 `id`、`type`（`pause_erase` 或 `speed_drop`）、`startedAt`、`x`、`y` 和 `durationMs`。后者在停顿涂改中代表停顿时长，在速度骤降中代表检测到的低速时长。
+`strokes` 保留尚未撤销的绘制操作，按顺序回放即可重现画面。橡皮带有 `tool: "eraser"`。撤销恢复上一步画面，已观测到的卡壳事件仍留在历史里。事件包含 `id`、`type`（`pause_erase`、`speed_drop` 或 `cognitive_stall`）、`startedAt`、`x`、`y` 和 `durationMs`。导出文件同时包含 `annotations`（伴随微标注标签如 `DEEP_THINKING_HOLD`、`SELF_CORRECTION`、`STUCK_CONCEPT_GAP`、`STUCK_CALCULATION`）与降采样 `stateTrace`（`[M, R, A]` 轨迹），标记为 `meta.version = "2.0-annotated"`，可用于 `ml/` 训练与消融验证。
+
+## 端侧双流神经架构、当前进展与后续优化需求
+
+### 1. 模型与引擎架构简述
+
+本分支在原有规则检测（`src/stalls/`）基础上，引入全自研的**端侧时空解耦双流神经网络 + 个性化闭环路由架构**（无新增第三方原生依赖，纯 TypeScript `Float32Array` 内核可直接在 Expo Go 真机离线推理）：
+
+- **流 1 · 数学笔迹识别与语义编码器（`EdgeMathEncoder`）**：主动丢弃时间戳，仅对笔迹执行**零截断自适应等弧长 6 通道重采样**（`[dx, dy, cosθ, sinθ, pen_state, y_rel]`，`max_len=192`），消除 60Hz/120Hz 帧率与快慢手差异；经 `ConvSubsample(stride=2)`、无参正弦位置编码与 4 层轻量 Conformer（`d=96`, 473.5K 参数）及 CTC Prefix Beam Search（`beam=4`），输出 **125 词表大学数学 LaTeX** 与每笔语义向量。
+- **流 2 · 严格因果认知状态网络（`CognitiveStateNet`）**：以笔画决策步为单位，提取 **10 维无采样率依赖动力学脉冲**（对数耗时、个人对数停顿 Z 分数、速度比与笔内速度波动 `speed_instab`、停顿前动量 `pre_pause_m`、擦除/碎片标记、$\tau=1.5\text{s}/10\text{s}$ 多尺度指数衰减积分、题谱对齐度 $A$），经过严格单向 2 层因果 GRU（`d=64`，杜绝未来泄漏）与数学语义做因果交叉注意力融合，输出 **6 类细粒度认知状态**与连续潜空间 `[M, R, A]`：
+  - `FLUENT_DERIVATION`（顺畅推导）
+  - `DEEP_THINKING_HOLD`（深度心算：**训练期 2.0× 防误报代价惩罚 + 运行时主动抑制弹窗**）
+  - `CALC_MICRO_HESITATION`（算式微卡：自动匹配 **`L0` 微轻推**，轻提醒不打断心流）
+  - `STUCK_CALCULATION`（算式受阻）
+  - `STUCK_CONCEPT_GAP`（思路断链）
+  - `DIRECTION_DRIFT_PITFALL`（歧路偏离：实时拦截如“漏讨论 `|A|=0`”“泰勒截断阶数不够”等高发陷阱）
+- **外环个性化与离线图谱闭环**：7 维上下文 **LinUCB** 根据个人状态动态选择 **6 种提示风格**与 **`L0-L3` 四级渐进提示**，并结合「5 秒恢复书写」隐式正反馈及底部微标注胶囊在线微调个人阈值；[sampleProblems.ts](src/engine/sampleProblems.ts) 内置 6 道覆盖高数、线代、概率论的离线解题图谱示例，断网即可完整体验。
+
+### 2. 目前实现情况与实测基准
+
+| 模块 | 当前状态 | 关键指标 / 实现说明 |
+| :--- | --- | :--- |
+| **端侧数学识别 (`EdgeMathEncoder`)** | **已完成并内置量化权重** | 基于 160,000 条真实 Google MathWriting 样本 + 8,000 条大学数学模板强化训练；独立真实验证 `real_val_CER = 0.1445`（`train-val gap = +0.0297`，无过拟合）；未见过的真实 `test` 集 `Beam4 CER = 0.1560`（字符准确率 **84.4%**）；纯 TS INT8 权重包 `src/engine/edgeNeuralWeights.ts` 体积 **807.2 KB**，单行推理约 `26.6 ms` |
+| **端侧认知状态网 (`CognitiveStateNet`)** | **权重与链路已打通，待真实数据微调** | PyTorch ↔ ONNX 误差 `1.91e-06`，PyTorch ↔ Pure-TS 6 分类预测一致性 `6/6`（`max_prob_diff = 0.0000`），纯 TS 单窗耗时 **`1.36 ms`**；已全面接入心算抑制、L0 微轻推与歧路预警；目前 Stage 3 基于合成会话训练（测试基准 `F1=1.0000` 仅代表理论拟合上界），需用真实人类采样替代 |
+| **移动端核心引擎与工程验证** | **已贯通且零新增依赖** | `package.json` 保持 0 新增包；`npm run typecheck` 通过；Python ↔ Pure-TS 数值对齐与 `HandwritingPulseEngine` 端到端集成断言全部通过；`ml/train/evaluate_real_louo.py` 已就绪 |
+
+### 3. 后续重点优化工作需求
+
+1. **真实人类手写数据微调 Stage 3（最高优先级）**：收集快/中/慢三组真实学生在平板/手机解题的 `v2.0-annotated` JSON 会话，使用 `ml/train/evaluate_real_louo.py` 执行留一用户交叉验证（LOUO-CV），将真实场景下的**深度心算误报率 `ThinkFPR` 压至 `< 5%`**、`StuckF1 ≥ 0.85`、`6C_MacroF1 ≥ 0.78`。
+2. **多行/二维复杂公式识别升级**：继续优化矩阵块、多重分式与长积分上下限的 2D 排版解析，并在真机压测后按需接入可选原生 `IInkSyntaxEncoderAdapter`（ONNX Runtime 加速）。
+3. **真机画布防抖与渲染优化**：对 `EdgeMathEncoder` 增加停笔微防抖/异步队列，补充真机 60Hz/120Hz 渲染帧率与内存 PSS 实测记录，并拓展多页草稿纸与手掌防误触。
+4. **前后端服务闭环**：后端托管 LLM/VLM 安全代理网关与题库解题图谱数据库，前端接入拍照识题与匿名标注/画像云同步。
 
 ## 如何打包成 APK
 
@@ -110,7 +141,9 @@ Expo 会把 `EXPO_PUBLIC_*` 写入客户端程序，持有 APK 的人可以从�
 
 - `src/capture/` 使用开源 Gesture Handler、Reanimated 与 Worklets 在 UI 线程接收触点，以单调时钟映射 Unix 毫秒。Skia 绘图随帧刷新，采样与显示分开执行。
 - `src/stalls/` 的距离、速度滑窗、停顿与涂改匹配、冷却和事件分组由项目自研。界面使用 React Native 及开源 Safe Area Context 适配系统边缘。
-- `src/hints/` 管理本地分层提示和兼容服务请求。在线内容由实际配置的模型服务生成。
+- `src/engine/` 端侧多源认知引擎由 [团队名称] 全自研实现：包含几何语法编码与步骤对齐 (`inkSyntaxEncoder.ts`)、连续认知状态机 $[M, R, A]$ 与个人运动指纹 (`cognitiveState.ts`)、7 维 LinUCB 提示路由 (`personalizedPolicy.ts`)、解题图谱缓存 (`solutionCache.ts` & `sampleProblems.ts`)、题干多模态/文本摄入 (`problemIngestor.ts`)、端侧提示合成 (`edgeHintModel.ts`) 及伴随微标注采集 (`annotationTracker.ts`)。
+- `src/hints/` 管理本地分层提示、防剧透校验与兼容服务请求。在线内容由实际配置的模型服务生成。
 - `src/export/` 使用开源 expo-file-system 写入本机文件，先写临时文件再改名，安卓另存使用系统目录选择器。
+- `ml/` 提供配套离线双流模型（PyTorch + ONNX 导出）与纯 CPU 基准评测流水线（基于 NumPy / scikit-learn）。
 
 从 `main` 创建分支，并用中文写明设备、输入动作及验证结果。[贡献指南](CONTRIBUTING.md) · [MIT 许可证](LICENSE)

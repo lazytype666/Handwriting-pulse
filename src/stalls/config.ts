@@ -1,4 +1,4 @@
-export type StallType = 'pause_erase' | 'speed_drop';
+export type StallType = 'pause_erase' | 'speed_drop' | 'cognitive_stall';
 export type InkTool = 'pen' | 'eraser';
 
 export interface StallEvent {

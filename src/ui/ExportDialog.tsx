@@ -23,7 +23,10 @@ export function ExportDialog({ result, copying, onCopy, onClose }: Props) {
             </Text>
             {result.kind === 'saved' ? (
               <>
-                <Text style={styles.summary}>{result.receipt.strokeCount} 笔 · {result.receipt.pointCount} 个采样点 · {result.receipt.stallCount} 次卡壳</Text>
+                <Text style={styles.summary}>
+                  {result.receipt.strokeCount} 笔 · {result.receipt.pointCount} 个采样点 · {result.receipt.stallCount} 次卡壳
+                  {result.receipt.annotationCount !== undefined ? ` · ${result.receipt.annotationCount} 条标注` : ''}
+                </Text>
                 <Text style={styles.caption}>应用文档目录</Text>
                 <Text selectable style={styles.path}>{result.receipt.uri}</Text>
                 {result.copyUri && (
