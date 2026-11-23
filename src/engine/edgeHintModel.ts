@@ -1,6 +1,7 @@
 import {
   filterSafeHintText,
   levelInstructions,
+  resolveChatEndpoint,
   styleInstructions,
   systemMessage,
   TIMEOUT_MS,
@@ -11,6 +12,7 @@ import type { StallType } from '../stalls';
 import type { HintStyle } from './personalizedPolicy';
 import {
   getOfflineStyledHint,
+  MATH_DOMAIN_KNOWLEDGE,
   type SolutionCacheEntry,
   type SolutionPitfallSpec,
 } from './solutionCache';
@@ -23,13 +25,8 @@ export interface EdgeHintContext {
   recognizedLatex?: string;
 }
 
-const MATH_KEYWORD_CLUES: Array<{ pattern: RegExp; clue: string }> = [
-  { pattern: /lim|极限|泰勒|洛必达|等价无穷小/, clue: '分母主部等价阶数与“上下同阶”泰勒展开原则' },
-  { pattern: /∫|变上限|积分|分部积分/, clue: '变上限积分求导公式或分部积分（u, dv）选取顺序' },
-  { pattern: /微分方程|y'|特解/, clue: '凑微分或化为标准线性形并保留积分常数 C 定初值' },
-  { pattern: /矩阵|行列式|秩|Ax\s*=|方程组/, clue: '系数行列式 |A|=0 临界点及增广矩阵行秩比对' },
-  { pattern: /特征值|正交|对称矩阵|相似对角化/, clue: '实对称矩阵不同特征值向量正交与重根施密特正交化' },
-  { pattern: /贝叶斯|全概率|条件概率|P\(|随机变量|期望|方差/, clue: '完备事件组先验加权、条件概率竖杠顺序与分布公式' },
+const EXTRA_MATH_CLUES: Array<{ pattern: RegExp; clue: string }> = [
+  ...MATH_DOMAIN_KNOWLEDGE.map(({ pattern, clue }) => ({ pattern, clue })),
   { pattern: /单调|对称轴|抛物线|二次函数/, clue: '一阶导数正负符号变化或开口与边界条件' },
   { pattern: /ln\s*x|求导|极值|切线/, clue: '对数定义域 x > 0 与乘积/复合求导法则' },
   { pattern: /数列|通项|级数|收敛/, clue: '首项与通项验证或正项/交错级数判别法' },
@@ -68,17 +65,15 @@ export class EdgeHintModelAdapter implements IEdgeHintModelAdapter {
 
     // 1. 若命中了明确的易错歧路特征，优先弹出靶向预警（毫秒级，零推理耗时）
     if (ctx.hitPitfall?.warningHint) {
-      const safe = filterSafeHintText(ctx.hitPitfall.warningHint);
+      const safe = filterSafeHintText(ctx.hitPitfall.warningHint, ctx.solutionEntry?.sealedFinalAnswer);
       if (safe) return safe;
     }
 
-    // 2. 若配置了本地局域网/真机端侧小模型端点（如 Qwen2.5-Math-1.5B GGUF Server），尝试端侧推理
+    // 2. 若配置了本地局域网/真机端侧小模型端点（如 Ollama qwen2-math:1.5b / deepseek-r1:1.5b），尝试端侧推理
     const edgeBase = process.env.EXPO_PUBLIC_EDGE_LLM_URL?.trim().replace(/\/+$/, '');
-    const edgeModel = process.env.EXPO_PUBLIC_EDGE_LLM_MODEL?.trim() || 'qwen2.5-math-1.5b';
+    const edgeModel = process.env.EXPO_PUBLIC_EDGE_LLM_MODEL?.trim() || 'qwen2-math:1.5b';
     if (edgeBase && params.question.trim()) {
-      const endpoint = edgeBase.endsWith('/chat/completions')
-        ? edgeBase
-        : edgeBase + '/v1/chat/completions';
+      const endpoint = resolveChatEndpoint(edgeBase, true);
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
       try {
@@ -95,6 +90,8 @@ export class EdgeHintModelAdapter implements IEdgeHintModelAdapter {
           body: JSON.stringify({
             model: edgeModel,
             stream: false,
+            temperature: 0.2,
+            max_tokens: 180,
             messages: [
               { role: 'system', content: systemMessage },
               {
@@ -114,7 +111,10 @@ export class EdgeHintModelAdapter implements IEdgeHintModelAdapter {
         });
         if (response.ok) {
           const data = (await response.json()) as CompletionResponse;
-          const text = filterSafeHintText(data?.choices?.[0]?.message?.content);
+          const text = filterSafeHintText(
+            data?.choices?.[0]?.message?.content,
+            ctx.solutionEntry?.sealedFinalAnswer,
+          );
           if (text) return text;
         }
       } catch {
@@ -166,7 +166,7 @@ export class EdgeHintModelAdapter implements IEdgeHintModelAdapter {
 
     const q = params.question.trim();
     if (q) {
-      const matchedClue = MATH_KEYWORD_CLUES.find(c => c.pattern.test(q));
+      const matchedClue = EXTRA_MATH_CLUES.find(c => c.pattern.test(q));
       if (matchedClue && params.level === 1) {
         return `结合这道题的核心条件，先检查一下「${matchedClue.clue}」有没有用上？`;
       }

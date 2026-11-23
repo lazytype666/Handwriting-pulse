@@ -39,7 +39,12 @@ import {
   type HintStyle,
   type PolicySnapshot,
 } from './personalizedPolicy';
-import { ProblemIngestorAdapter, type IngestedProblemResult } from './problemIngestor';
+import {
+  parseLatexBlocks,
+  ProblemIngestorAdapter,
+  type IngestedProblemResult,
+  type ProblemContentBlock,
+} from './problemIngestor';
 import {
   loadPersistedProfile,
   savePersistedProfile,
@@ -62,6 +67,15 @@ import type {
   IStorageAdapter,
 } from './types';
 
+export interface ProblemCacheOverview {
+  cached: boolean;
+  sourceMode?: SolutionCacheEntry['sourceMode'];
+  stepCount: number;
+  pitfallCount: number;
+  hasSealedAnswer: boolean;
+  stepGoals: string[];
+}
+
 export {
   ANNOTATION_LABEL_ZH,
   AnnotationTracker,
@@ -77,6 +91,7 @@ export {
   HINT_STYLE_LABELS,
   loadPersistedProfile,
   LocalStorageAdapter,
+  parseLatexBlocks,
   ProblemIngestorAdapter,
   SAMPLE_PROBLEMS,
   savePersistedProfile,
@@ -95,6 +110,7 @@ export {
   type NeuralMathOutput,
   type PersistedUserProfile,
   type PolicySnapshot,
+  type ProblemContentBlock,
   type SampleProblemSpec,
   type SolutionCacheEntry,
   type StateTraceSample,
@@ -302,6 +318,38 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
 
   public setProblemTextOnly(problemText: string): void {
     this.problemText = problemText;
+  }
+
+  public async ingestProblemDraftFromOcr(rawOcrText: string): Promise<IngestedProblemResult> {
+    return this.problemIngestor.refineOcrText(rawOcrText);
+  }
+
+  public async ingestProblemDraftFromImage(
+    imageUri: string,
+    hintMlkitText?: string,
+  ): Promise<IngestedProblemResult> {
+    return this.problemIngestor.ingestFromImageUri(imageUri, hintMlkitText);
+  }
+
+  public getProblemCacheOverview(problemText = this.problemText): ProblemCacheOverview {
+    const entry = this.solutionCache.getEntry(problemText);
+    if (!entry) {
+      return {
+        cached: false,
+        stepCount: 0,
+        pitfallCount: 0,
+        hasSealedAnswer: false,
+        stepGoals: [],
+      };
+    }
+    return {
+      cached: true,
+      sourceMode: entry.sourceMode,
+      stepCount: entry.steps.length,
+      pitfallCount: entry.commonPitfalls.length,
+      hasSealedAnswer: Boolean(entry.sealedFinalAnswer),
+      stepGoals: entry.steps.map(s => s.goalDescription).filter(Boolean).slice(0, 5),
+    };
   }
 
   public async updateProblemText(problemText: string): Promise<boolean> {

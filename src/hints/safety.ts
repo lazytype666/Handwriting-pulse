@@ -3,6 +3,63 @@ import type { HintStyle } from '../engine/personalizedPolicy';
 export type HintLevel = 0 | 1 | 2 | 3;
 
 export const TIMEOUT_MS = 8000;
+export const PREWARM_TIMEOUT_MS = 45000;
+
+const LOCAL_ENDPOINT_RE =
+  /^https?:\/\/(?:127\.0\.0\.1|localhost|auto|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)|^https?:\/\/[^/]+:\d+$/i;
+
+declare const require: ((id: string) => unknown) | undefined;
+
+function extractExpoDevHost(): string | null {
+  try {
+    if (typeof require !== 'function') return null;
+    // 延迟加载 expo-constants，兼容纯 Node 测试环境
+    const mod = require('expo-constants') as {
+      default?: { expoConfig?: { hostUri?: string | null }; linkingUri?: string | null };
+      expoConfig?: { hostUri?: string | null };
+      linkingUri?: string | null;
+    };
+    const c = mod?.default ?? mod;
+    const rawUri = c?.expoConfig?.hostUri || c?.linkingUri || '';
+    const cleaned = rawUri.replace(/^[a-zA-Z+.-]+:\/\//, '');
+    const host = cleaned.split('/')[0]?.split(':')[0]?.trim();
+    if (host && host !== 'localhost' && !host.endsWith('.exp.direct')) {
+      return host;
+    }
+  } catch {
+    // 非 Expo 运行时（如 Node 单测）回退 127.0.0.1
+  }
+  return null;
+}
+
+/** 将开发占位主机（如 http://auto:11434）动态解析为当前 Metro/热点的电脑局域网 IP */
+export function resolveDevHostUrl(baseUrl: string): string {
+  const clean = baseUrl.trim().replace(/\/+$/, '');
+  if (!clean) return '';
+  if (/^https?:\/\/auto(?::\d+|\/|$)/i.test(clean)) {
+    const devHost = extractExpoDevHost() || '127.0.0.1';
+    return clean.replace(/^(https?:\/\/)auto\b/i, `$1${devHost}`);
+  }
+  return clean;
+}
+
+/** 判断目标地址是否为局域网/本机端侧推理服务（免云端鉴权 Key） */
+export function isLocalModelUrl(baseUrl: string): boolean {
+  const resolved = resolveDevHostUrl(baseUrl);
+  return Boolean(resolved && LOCAL_ENDPOINT_RE.test(resolved));
+}
+
+/**
+ * 统一规范化 OpenAI 兼容或 Ollama 本地模型 Chat Completions 接口地址。
+ */
+export function resolveChatEndpoint(baseUrl: string, preferV1 = true): string {
+  const clean = resolveDevHostUrl(baseUrl);
+  if (!clean) return '';
+  if (clean.endsWith('/chat/completions') || clean.endsWith('/api/chat')) return clean;
+  if (clean.endsWith('/v1')) return `${clean}/chat/completions`;
+  const isLocal = LOCAL_ENDPOINT_RE.test(clean);
+  return preferV1 || isLocal ? `${clean}/v1/chat/completions` : `${clean}/chat/completions`;
+}
 
 export const levelInstructions: Record<HintLevel, string> = {
   0: '用不超过十五字发出极简微提醒（如核对负号或定义域），绝不中断思路。',
@@ -30,20 +87,35 @@ export const systemMessage = [
 export interface CompletionResponse {
   choices?: Array<{
     finish_reason?: string | null;
-    message?: { content?: unknown; refusal?: unknown };
+    message?: {
+      content?: unknown;
+      reasoning?: unknown;
+      reasoning_content?: unknown;
+      refusal?: unknown;
+    };
   }>;
 }
 
 /**
- * 过滤掉包含最终答案、完整解答、思考标签或直接数字结论的候选文本。
+ * 过滤掉包含最终答案、完整解答、思考标签、封存答案泄漏或直接数字结论的候选文本。
  */
-export function filterSafeHintText(raw: unknown): string | null {
+export function filterSafeHintText(raw: unknown, sealedFinalAnswer?: string): string | null {
   if (typeof raw !== 'string') return null;
-  const text = raw.trim();
+  const text = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
   const revealsAnswer = /(?:最终答案|正确答案|最终结果|答案\s*[:：为是]|^答\s*[:：]|\\boxed\s*\{|<think>)/i.test(text);
   const bareResult = /^(?:[a-z]{1,3}\s*[=＝]\s*)?[-+]?\d+(?:[./]\d+)?(?:\s*(?:%|cm|mm|厘米|米|度))?[。.！!]?$/i.test(text);
-  if (!text || text.length > 300 || revealsAnswer || bareResult || /\bthe (?:final )?answer is\b/i.test(text)) {
+  if (!text || text.length > 300 || revealsAnswer || bareResult || /\b(?:the (?:final )?answer is|state the final answer|the limit (?:is|evaluates to)\s+[-+]?\d|evaluates to\s+[-+]?\d)\b/i.test(text)) {
     return null;
+  }
+
+  // 防泄漏：如果封存了具体最终答案串，拦截包含完整答案结论的提示（排除单个字符 "0"/"1" 误杀）
+  const sealed = sealedFinalAnswer?.replace(/^\$+|\$+$/g, '').trim();
+  if (sealed && sealed.length >= 2) {
+    const escaped = sealed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const exactPhraseRe = new RegExp(`(?:=|为|是|等于)\\s*${escaped}(?:$|[^0-9a-zA-Z])`, 'i');
+    if (exactPhraseRe.test(text) || (sealed.length >= 5 && text.includes(sealed))) {
+      return null;
+    }
   }
   return text;
 }

@@ -4,6 +4,7 @@ import type { StallType } from '../stalls';
 import {
   levelInstructions,
   readHintFromCompletion,
+  resolveChatEndpoint,
   styleInstructions,
   systemMessage,
   TIMEOUT_MS,
@@ -47,7 +48,7 @@ export async function getHint(request: HintRequest, signal?: AbortSignal): Promi
   const model = process.env.EXPO_PUBLIC_LLM_MODEL?.trim();
   const question = request.question.trim();
   if (!question || !base || !key || !model || signal?.aborted) return fallback;
-  const endpoint = base.endsWith('/chat/completions') ? base : base + '/chat/completions';
+  const endpoint = resolveChatEndpoint(base, false);
   const controller = new AbortController();
   const abort = () => controller.abort();
   const deadline = new Promise<HintResult>(resolve => {

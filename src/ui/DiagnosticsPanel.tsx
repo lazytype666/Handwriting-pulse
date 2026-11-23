@@ -9,6 +9,7 @@ import {
   type CompanionMode,
 } from '../engine';
 import type { Thresholds } from '../stalls';
+import { latexToReadableMath } from '../utils/mathFormat';
 import { ActionButton } from './Controls';
 import { STALL_LABEL } from './HistoryView';
 
@@ -126,7 +127,7 @@ export function DiagnosticsPanel({
                   </Text>
                   {!!cognitiveState.recognizedLatex && (
                     <Text numberOfLines={1} style={styles.small}>
-                      语法　{cognitiveState.recognizedLatex}
+                      语法　{latexToReadableMath(cognitiveState.recognizedLatex)}
                     </Text>
                   )}
                 </>
@@ -166,7 +167,7 @@ export function DiagnosticsPanel({
                       干预倾向 P(t)　{cognitiveState.interventionScore.toFixed(2)} / 阈值 {(interventionThreshold ?? 0.62).toFixed(2)}（惊奇 S={cognitiveState.surpriseScore.toFixed(2)}）
                     </Text>
                     <Text style={styles.readout}>
-                      语法对齐　{cognitiveState.matchedStepIndex >= 0 ? `第 ${cognitiveState.matchedStepIndex + 1} 步` : '自由推导'} · {cognitiveState.recognizedLatex || '等待落笔'}
+                      语法对齐　{cognitiveState.matchedStepIndex >= 0 ? `第 ${cognitiveState.matchedStepIndex + 1} 步` : '自由推导'} · {cognitiveState.recognizedLatex ? latexToReadableMath(cognitiveState.recognizedLatex) : '等待落笔'}
                     </Text>
                   </>
                 )}

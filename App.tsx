@@ -76,6 +76,7 @@ function Workspace() {
   });
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [question, setQuestion] = useState('');
+  const [prewarmState, setPrewarmState] = useState<'idle' | 'prewarming' | 'ready' | 'offline'>('idle');
   const [view, setView] = useState<'question' | 'history' | null>(null);
   const [events, setEvents] = useState<StallEvent[]>([]);
 
@@ -119,42 +120,48 @@ function Workspace() {
   // 2. 笔迹落笔完成 / 撤销事件实时进入双流神经语法编码器与因果认知状态网络
   const onStrokeComplete = useCallback(
     (stroke: Stroke) => {
-      void engineRef.current.onStrokeComplete(stroke).then(() => {
-        syncAnnotationCounter();
-        setCognitiveTick((prev) =>
-          prev
-            ? {
-                ...prev,
-                cognitiveState: engineRef.current.getCognitiveState(),
-                suggestedHintLevel: engineRef.current.getSuggestedHintLevel(),
-              }
-            : {
-                cognitiveState: engineRef.current.getCognitiveState(),
-                interventionThreshold: 0.62,
-                cognitiveStallEvent: null,
-                suggestedHintLevel: engineRef.current.getSuggestedHintLevel(),
-                settledFeedback: null,
-              },
-        );
-      });
+      void engineRef.current
+        .onStrokeComplete(stroke)
+        .then(() => {
+          syncAnnotationCounter();
+          setCognitiveTick((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  cognitiveState: engineRef.current.getCognitiveState(),
+                  suggestedHintLevel: engineRef.current.getSuggestedHintLevel(),
+                }
+              : {
+                  cognitiveState: engineRef.current.getCognitiveState(),
+                  interventionThreshold: 0.62,
+                  cognitiveStallEvent: null,
+                  suggestedHintLevel: engineRef.current.getSuggestedHintLevel(),
+                  settledFeedback: null,
+                },
+          );
+        })
+        .catch(() => {});
     },
     [syncAnnotationCounter],
   );
 
   const onStrokeUndo = useCallback(
     (stroke: Stroke) => {
-      void engineRef.current.onStrokeUndo(stroke).then(() => {
-        syncAnnotationCounter();
-        setCognitiveTick((prev) =>
-          prev
-            ? {
-                ...prev,
-                cognitiveState: engineRef.current.getCognitiveState(),
-                suggestedHintLevel: engineRef.current.getSuggestedHintLevel(),
-              }
-            : null,
-        );
-      });
+      void engineRef.current
+        .onStrokeUndo(stroke)
+        .then(() => {
+          syncAnnotationCounter();
+          setCognitiveTick((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  cognitiveState: engineRef.current.getCognitiveState(),
+                  suggestedHintLevel: engineRef.current.getSuggestedHintLevel(),
+                }
+              : null,
+          );
+        })
+        .catch(() => {});
     },
     [syncAnnotationCounter],
   );
@@ -250,6 +257,23 @@ function Workspace() {
           <ActionButton label={question ? '查看题干' : '题干'} onPress={() => setView('question')} />
           <ActionButton label="历史" onPress={() => setView('history')} />
         </View>
+        {!!question && prewarmState !== 'idle' && (
+          <View
+            style={[
+              styles.prewarmBadge,
+              prewarmState === 'ready' && styles.prewarmReady,
+              prewarmState === 'prewarming' && styles.prewarmBusy,
+            ]}
+          >
+            <Text style={styles.prewarmText}>
+              {prewarmState === 'prewarming'
+                ? '图谱预解中…'
+                : prewarmState === 'ready'
+                  ? '图谱已缓存'
+                  : '离线兜底'}
+            </Text>
+          </View>
+        )}
         {width >= 600 && !!question && (
           <Text numberOfLines={1} style={styles.preview}>
             {question}
@@ -305,14 +329,14 @@ function Workspace() {
             label="撤销"
             disabled={!history.canUndo}
             onPress={() => {
-              void canvas.current?.undo();
+              void canvas.current?.undo().catch(() => {});
             }}
           />
           <ActionButton
             label="重做"
             disabled={!history.canRedo}
             onPress={() => {
-              void canvas.current?.redo();
+              void canvas.current?.redo().catch(() => {});
             }}
           />
           <ActionButton
@@ -333,12 +357,21 @@ function Workspace() {
       {view === 'question' && (
         <QuestionEditor
           question={question}
+          engine={engineRef.current}
           onClose={() => setView(null)}
           onSave={(value) => {
             if (value !== question) dismiss();
             setQuestion(value);
             setView(null);
-            void engineRef.current.updateProblemText(value);
+            if (!value) {
+              setPrewarmState('idle');
+              void engineRef.current.updateProblemText(value);
+              return;
+            }
+            setPrewarmState('prewarming');
+            void engineRef.current.updateProblemText(value).then((cachedOk) => {
+              setPrewarmState(cachedOk ? 'ready' : 'offline');
+            });
           }}
         />
       )}
@@ -395,6 +428,17 @@ const styles = StyleSheet.create({
   title: { color: '#253f35', fontWeight: '700', fontSize: 18, flexShrink: 1 },
   preview: { flex: 1, color: '#52665d', marginLeft: 8 },
   topActions: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap' },
+  prewarmBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 12,
+    backgroundColor: '#eef3f1',
+    borderWidth: 1,
+    borderColor: '#ccd8d2',
+  },
+  prewarmBusy: { backgroundColor: '#fbf5e6', borderColor: '#e5cf9b' },
+  prewarmReady: { backgroundColor: '#e9f4ee', borderColor: '#b3d4c2' },
+  prewarmText: { fontSize: 11.5, fontWeight: '600', color: '#27473d' },
   paper: { flex: 1, overflow: 'hidden', backgroundColor: '#fff' },
   hintSpace: {
     position: 'absolute',

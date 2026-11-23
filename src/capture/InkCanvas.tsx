@@ -1,4 +1,4 @@
-import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useState } from 'react';
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { StyleSheet } from 'react-native';
 import {
   Canvas,
@@ -12,7 +12,7 @@ import {
 } from '@shopify/react-native-skia';
 import { GestureDetector, GestureStateManager, useManualGesture } from 'react-native-gesture-handler';
 import { useFrameCallback, useSharedValue } from 'react-native-reanimated';
-import { runOnUIAsync, scheduleOnRN } from 'react-native-worklets';
+import { scheduleOnRN, scheduleOnUI } from 'react-native-worklets';
 import { ERASER_WIDTH, REWRITE_WINDOW_MS, type InkTool, type StallEvent, type Thresholds } from '../stalls/config';
 import { cooldownLeft, createDetector, detect } from '../stalls/detection';
 import { createFeatures, observeTouch, pauseAt, speedRatioAt } from '../stalls/features';
@@ -95,6 +95,37 @@ export const InkCanvas = memo(
       limits.value = thresholds;
     }, [limits, thresholds]);
 
+    const callbacksRef = useRef({
+      onDiagnostics,
+      onStall,
+      onStrokeComplete,
+      onStrokeUndo,
+      onHistory,
+    });
+    callbacksRef.current = {
+      onDiagnostics,
+      onStall,
+      onStrokeComplete,
+      onStrokeUndo,
+      onHistory,
+    };
+
+    const emitDiagnostics = useCallback((diag: Diagnostics) => {
+      callbacksRef.current.onDiagnostics(diag);
+    }, []);
+    const emitStall = useCallback((event: StallEvent) => {
+      callbacksRef.current.onStall(event);
+    }, []);
+    const emitStrokeComplete = useCallback((stroke: Stroke) => {
+      callbacksRef.current.onStrokeComplete?.(stroke);
+    }, []);
+    const emitStrokeUndo = useCallback((stroke: Stroke) => {
+      callbacksRef.current.onStrokeUndo?.(stroke);
+    }, []);
+    const emitHistory = useCallback((nextHistory: CanvasHistory) => {
+      callbacksRef.current.onHistory(nextHistory);
+    }, []);
+
     const [geometry] = useState(makeGeometry);
     const paths = useSharedValue<{ path: SkPath; tool: InkTool }[]>([]);
     // 撤销时同时保留下一步可恢复的路径和采集记录。新笔画落笔后清空。
@@ -110,7 +141,9 @@ export const InkCanvas = memo(
       // 在白纸上按时间顺序重放开源 Skia 路径。橡皮仅覆盖其经过的条带；
       // 撤销橡皮后，被覆盖的笔画从原始路径恢复，之后画的笔可正常盖回。
       const target = geometry.picture.beginRecording();
-      for (const saved of paths.value) {
+      const savedList = paths.value;
+      for (let i = 0; i < savedList.length; i++) {
+        const saved = savedList[i];
         target.drawPath(saved.path, saved.tool === 'eraser' ? geometry.eraser : geometry.pen);
       }
       finished.value = geometry.picture.finishRecordingAsPicture();
@@ -120,19 +153,21 @@ export const InkCanvas = memo(
       'worklet';
       if (recorder.value.writer === null) return;
       recorder.value.writer = null;
-      paths.value.push({
+      const nextPaths = paths.value.slice();
+      nextPaths.push({
         path: geometry.builder.build(),
         tool: activeTool.value,
       });
+      paths.value = nextPaths;
       geometry.builder.reset();
       livePen.value = geometry.empty;
       liveEraser.value = geometry.empty;
       dirty.value = false;
       refreshPicture();
-      if (onStrokeComplete && recorder.value.strokes.length > 0) {
+      if (recorder.value.strokes.length > 0) {
         const latest = recorder.value.strokes[recorder.value.strokes.length - 1];
         if (latest.points.length > 0) {
-          scheduleOnRN(onStrokeComplete, {
+          scheduleOnRN(emitStrokeComplete, {
             id: latest.id,
             ...(latest.tool ? { tool: latest.tool } : {}),
             points: latest.points.map((point) => ({
@@ -148,7 +183,7 @@ export const InkCanvas = memo(
     // 工具按钮只在 JS 线程渲染，撤销/重做可用性由画布在每次结构变化后回报。
     const reportHistory = () => {
       'worklet';
-      scheduleOnRN(onHistory, {
+      scheduleOnRN(emitHistory, {
         canUndo: recorder.value.strokes.length > 0,
         canRedo: redoStack.value.length > 0,
       });
@@ -158,66 +193,113 @@ export const InkCanvas = memo(
       ref,
       () => ({
         snapshot: () =>
-          runOnUIAsync(() => {
-            'worklet';
-            // 事件和点都由 UI 线程写入，同一屏障复制二者，不会漏掉 JS 尚未显示的事件。
-            return {
-              strokes: copyStrokes(recorder.value),
-              stallEvents: detector.value.events.map((e) => ({ ...e })),
-            };
+          new Promise<{ strokes: Stroke[]; stallEvents: StallEvent[] }>((resolve, reject) => {
+            try {
+              scheduleOnUI(() => {
+                'worklet';
+                // 事件和点都由 UI 线程写入，同一屏障复制二者，不会漏掉 JS 尚未显示的事件。
+                scheduleOnRN(resolve, {
+                  strokes: copyStrokes(recorder.value),
+                  stallEvents: detector.value.events.map((e) => ({
+                    id: e.id,
+                    type: e.type,
+                    startedAt: e.startedAt,
+                    x: e.x,
+                    y: e.y,
+                    durationMs: e.durationMs,
+                  })),
+                });
+              });
+            } catch (err) {
+              reject(err);
+            }
           }),
-        undo: () =>
-          runOnUIAsync(() => {
+        undo: () => {
+          scheduleOnUI(() => {
             'worklet';
             finishStroke();
             const removed = recorder.value.strokes.pop();
-            if (!removed) return;
-            const saved = paths.value.pop();
-            if (saved) redoStack.value.push({ ...saved, stroke: removed });
+            if (!removed) {
+              reportHistory();
+              return;
+            }
+            const curPaths = paths.value;
+            const saved = curPaths[curPaths.length - 1];
+            paths.value = curPaths.slice(0, -1);
+            if (saved) {
+              const copiedPoints: Stroke['points'] = [];
+              for (let i = 0; i < removed.points.length; i++) {
+                const pt = removed.points[i];
+                copiedPoints.push({ x: pt.x, y: pt.y, t: pt.t });
+              }
+              const nextRedo = redoStack.value.slice();
+              nextRedo.push({
+                path: saved.path,
+                tool: saved.tool,
+                stroke: removed.tool
+                  ? { id: removed.id, tool: removed.tool, points: copiedPoints }
+                  : { id: removed.id, points: copiedPoints },
+              });
+              redoStack.value = nextRedo;
+            }
             if (removed.tool === 'eraser') {
               features.value.eraseAt = -1;
               features.value.erasePath = [];
             }
             refreshPicture();
             reportHistory();
-            if (onStrokeUndo) {
-              scheduleOnRN(onStrokeUndo, {
-                id: removed.id,
-                ...(removed.tool ? { tool: removed.tool } : {}),
-                points: removed.points.map((point) => ({
-                  x: point.x,
-                  y: point.y,
-                  t: point.t,
-                })),
-              });
+            const undoPoints: Stroke['points'] = [];
+            for (let i = 0; i < removed.points.length; i++) {
+              const pt = removed.points[i];
+              undoPoints.push({ x: pt.x, y: pt.y, t: pt.t });
             }
-          }),
-        redo: () =>
-          runOnUIAsync(() => {
+            scheduleOnRN(
+              emitStrokeUndo,
+              removed.tool
+                ? { id: removed.id, tool: removed.tool, points: undoPoints }
+                : { id: removed.id, points: undoPoints },
+            );
+          });
+          return Promise.resolve();
+        },
+        redo: () => {
+          scheduleOnUI(() => {
             'worklet';
             // 没有可重做的笔画时直接返回，避免误结束仍在书写的当前笔。
-            const saved = redoStack.value.pop();
-            if (!saved) return;
+            const curRedo = redoStack.value;
+            const saved = curRedo[curRedo.length - 1];
+            if (!saved) {
+              reportHistory();
+              return;
+            }
+            redoStack.value = curRedo.slice(0, -1);
             finishStroke();
-            recorder.value.strokes.push(saved.stroke);
-            paths.value.push({ path: saved.path, tool: saved.tool });
+            const copiedPoints: Stroke['points'] = [];
+            for (let i = 0; i < saved.stroke.points.length; i++) {
+              const pt = saved.stroke.points[i];
+              copiedPoints.push({ x: pt.x, y: pt.y, t: pt.t });
+            }
+            const restoredStroke: Stroke = saved.stroke.tool
+              ? { id: saved.stroke.id, tool: saved.stroke.tool, points: copiedPoints }
+              : { id: saved.stroke.id, points: copiedPoints };
+            recorder.value.strokes.push(restoredStroke);
+            const nextPaths = paths.value.slice();
+            nextPaths.push({ path: saved.path, tool: saved.tool });
+            paths.value = nextPaths;
             // 画布检测特征不因重做回滚；但引擎需要重新看到这枚笔画，保持会话与导出一致。
             refreshPicture();
             reportHistory();
-            if (onStrokeComplete) {
-              scheduleOnRN(onStrokeComplete, {
-                id: saved.stroke.id,
-                ...(saved.stroke.tool ? { tool: saved.stroke.tool } : {}),
-                points: saved.stroke.points.map((point) => ({
-                  x: point.x,
-                  y: point.y,
-                  t: point.t,
-                })),
-              });
-            }
-          }),
-        clear: () =>
-          runOnUIAsync(() => {
+            scheduleOnRN(
+              emitStrokeComplete,
+              saved.stroke.tool
+                ? { id: saved.stroke.id, tool: saved.stroke.tool, points: copiedPoints.slice() }
+                : { id: saved.stroke.id, points: copiedPoints.slice() },
+            );
+          });
+          return Promise.resolve();
+        },
+        clear: () => {
+          scheduleOnUI(() => {
             'worklet';
             // 清空画布但不删除已观测的卡壳事件，历史回看与导出仍保留这些记录。
             recorder.value = createRecorder();
@@ -233,7 +315,7 @@ export const InkCanvas = memo(
             liveEraser.value = geometry.empty;
             dirty.value = false;
             refreshPicture();
-            scheduleOnRN(onDiagnostics, {
+            scheduleOnRN(emitDiagnostics, {
               rate: 0,
               delta: null,
               pauseMs: 0,
@@ -243,9 +325,11 @@ export const InkCanvas = memo(
               lastStall: d.events.length ? d.events[d.events.length - 1].type : null,
             });
             reportHistory();
-          }),
+          });
+          return Promise.resolve();
+        },
       }),
-      [onHistory, onStrokeComplete, onStrokeUndo],
+      [emitDiagnostics, emitHistory, emitStrokeComplete, emitStrokeUndo],
     );
 
     const sample = (down: boolean, x: number, y: number, absoluteX: number, absoluteY: number, now: number) => {
@@ -269,7 +353,7 @@ export const InkCanvas = memo(
         absoluteY,
         limits.value,
       );
-      if (event) scheduleOnRN(onStall, event);
+      if (event) scheduleOnRN(emitStall, event);
       if (down) geometry.builder.moveTo(x, y);
       geometry.builder.lineTo(x, y);
       dirty.value = true;
@@ -335,7 +419,7 @@ export const InkCanvas = memo(
         const f = features.value;
         const d = detector.value;
         const nowRatio = speedRatioAt(f, now);
-        scheduleOnRN(onDiagnostics, {
+        scheduleOnRN(emitDiagnostics, {
           ...readDiagnostics(recorder.value, now),
           pauseMs: Math.round(pauseAt(f, now)),
           speedRatio: nowRatio === null ? null : Math.round(nowRatio * 100) / 100,
@@ -347,13 +431,13 @@ export const InkCanvas = memo(
         activeTool,
         detector,
         dirty,
+        emitDiagnostics,
         features,
         geometry,
         lastReportAt,
         limits,
         liveEraser,
         livePen,
-        onDiagnostics,
         recorder,
       ]),
     );

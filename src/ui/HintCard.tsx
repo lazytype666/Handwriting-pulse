@@ -1,8 +1,10 @@
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { HINT_STYLE_LABELS } from '../engine';
 import type { useHints } from '../hints';
+import { latexToReadableMath, parseMathSegments } from '../utils/mathFormat';
 import { ActionButton } from './Controls';
 import { STALL_LABEL } from './HistoryView';
+import { MathRichText } from './MathFormulaText';
 
 type Props = Pick<
   ReturnType<typeof useHints>,
@@ -30,7 +32,18 @@ export function HintCard({ current, advance, dismiss, dismissWithThinking }: Pro
         <Text style={styles.source}>{sourceLabel}</Text>
       </View>
       <ScrollView style={styles.scroll} contentContainerStyle={styles.copy}>
-        <Text accessibilityLiveRegion="polite" style={styles.text}>{current.text}</Text>
+        <View accessibilityLiveRegion="polite">
+          <MathRichText
+            text={
+              parseMathSegments(current.text).some((s) => s.type !== 'text')
+                ? current.text
+                : latexToReadableMath(current.text)
+            }
+            fontSize={15.5}
+            color="#22392b"
+            textStyle={styles.text}
+          />
+        </View>
       </ScrollView>
       <View style={styles.actions}>
         <ActionButton label="我在想，别打扰" onPress={dismissWithThinking} />

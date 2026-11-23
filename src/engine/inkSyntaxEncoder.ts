@@ -671,31 +671,67 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
     const metrics = visibleStrokes.map(measureStroke);
     const normalHeights = metrics
       .map(m => m.bbox.h)
-      .filter(h => h > 6 && h < 55);
-    const avgHeight =
-      normalHeights.length > 0
-        ? clamp(normalHeights.reduce((s, h) => s + h, 0) / normalHeights.length, 16, 38)
-        : 28;
+      .filter(h => h > 8 && h < 180)
+      .sort((a, b) => a - b);
+    const medianH =
+      normalHeights.length > 0 ? normalHeights[Math.floor(normalHeights.length / 2)] : 36;
+    const avgHeight = clamp(medianH, 18, 110);
 
-    // 1. 识别跨行成对大型定界符（如矩阵括号或行列式长竖线），并在行聚类时避免将其碎片化
+    // 1. 识别跨行成对大型定界符（如矩阵括号或行列式长竖线，排除竖直拉长的 ∫ / 字母）
     const tallDelimiters = metrics.filter(
-      m => m.bbox.h >= avgHeight * 2.0 && m.verticalness > 0.6,
+      m =>
+        m.bbox.h >= avgHeight * 2.0 &&
+        m.verticalness > 0.72 &&
+        m.bbox.h / Math.max(1, m.bbox.w) >= 2.4 &&
+        m.chordDeviation < 0.24,
     );
     const hasMatrixLayout = tallDelimiters.length >= 2;
     const regularMetrics = hasMatrixLayout
       ? metrics.filter(m => !tallDelimiters.includes(m))
       : metrics;
 
-    // 2. 普通笔画按垂直位置聚合成公式推导行
+    // 2. 仅当长横线上下两侧均存在非等号分子/分母笔画时，才视作真实分式线并合入同一推导行
+    const candidateBars = regularMetrics.filter(
+      m => m.horizontalness > 0.84 && m.bbox.w >= avgHeight * 0.9 && m.chordDeviation < 0.14,
+    );
+    const wideFracBars = candidateBars.filter(bar => {
+      const hasNum = regularMetrics.some(
+        s =>
+          s !== bar &&
+          !(s.horizontalness > 0.84 && s.bbox.h <= 6) &&
+          xOverlapRatio(bar.bbox, s.bbox) >= 0.2 &&
+          bar.cy - s.cy >= 4 &&
+          bar.cy - s.cy <= avgHeight * 1.6,
+      );
+      const hasDen = regularMetrics.some(
+        s =>
+          s !== bar &&
+          !(s.horizontalness > 0.84 && s.bbox.h <= 6) &&
+          xOverlapRatio(bar.bbox, s.bbox) >= 0.2 &&
+          s.cy - bar.cy >= 4 &&
+          s.cy - bar.cy <= avgHeight * 1.6,
+      );
+      return hasNum && hasDen;
+    });
+
+    // 3. 普通笔画按垂直位置聚合成公式推导行（仅在确认真实分式时保留上下界在同一行）
     const lines: StrokeMetrics[][] = [];
     for (const m of regularMetrics) {
       let targetLine: StrokeMetrics[] | null = null;
       for (const line of lines) {
         const lineBox = mergeBbox(line.map(x => x.bbox));
         const lineCenterY = lineBox.y + lineBox.h / 2;
+        const nearFracBand = wideFracBars.some(
+          bar =>
+            (line.includes(bar) || bar === m) &&
+            xOverlapRatio(bar.bbox, line.includes(bar) ? m.bbox : lineBox) >= 0.2 &&
+            Math.abs((line.includes(bar) ? bar.cy : m.cy) - (line.includes(bar) ? m.cy : lineCenterY)) <=
+              avgHeight * 1.65,
+        );
         if (
-          yOverlapRatio(lineBox, m.bbox) >= 0.2 ||
-          Math.abs(lineCenterY - m.cy) <= avgHeight * 0.85
+          yOverlapRatio(lineBox, m.bbox) >= 0.18 ||
+          Math.abs(lineCenterY - m.cy) <= avgHeight * 0.92 ||
+          nearFracBand
         ) {
           targetLine = line;
           break;
