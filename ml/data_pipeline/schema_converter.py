@@ -1,14 +1,13 @@
 """
-《笔迹脉搏》双流数据管线与 6 类认知状态转换器（决策步级对齐版）。
+《笔迹脉搏》双流数据管线与 6 类认知状态转换器（14 维因果动力学与解题图谱对照融合版）。
 
 【核心架构特性】
-1. 不对原始 60-120Hz 离散时间戳做 1-to-1 线性输入；
-2. 先由物理弧长/真实时间戳还原无采样率依赖的瞬时速度、停顿 Z 分数、以及多时间常数指数衰减积分
-   （τ = 1.5s 短时阻滞累积，τ = 10s 中期涂改犹豫能量）；
-3. 按“笔画 / 决策步”下标 j 同步对齐：
-   - 空间端：每一笔由 `arc_length_resample_strokes` 产生等弧长 6 通道序列 [L_s, 6] -> EdgeMathEncoder 提取语义 Z_sem[j]；
-   - 动力学端：10 维非线性变换特征 X_dyn[j] -> CausalGRU 提取时序状态 Z_dyn[j]；
-4. 支持 6 类物理+多源可辨识状态：
+1. 彻底解耦 60~120Hz 触控采样率：按物理弧长/真实时间戳还原无采样率依赖速度比、停顿 Z 分数、多时间常数指数衰减积分；
+2. DYNAMICS_DIM = 14：
+   - 0..9：笔画时长、个人停顿Z、速度比、速度波动、前序动量、橡皮、微笔、短停能量、涂改能量、方向对齐 A(t)
+   - 10..13（图四新增直连图谱状态）：[anchorGap, stepStagnation, stepAdvancePulse, stepProgress]
+3. 空间端：每笔生成 10 通道等弧长序列 [L_s, 10] -> EdgeMathGraphNet 提取语义 Z_sem[j]；
+4. 6 类认知状态：
    0=FLUENT_DERIVATION, 1=DEEP_THINKING_HOLD, 2=CALC_MICRO_HESITATION,
    3=STUCK_CALCULATION, 4=STUCK_CONCEPT_GAP, 5=DIRECTION_DRIFT_PITFALL
 """
@@ -23,7 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .mathwriting_loader import arc_length_resample_strokes
+from .mathwriting_loader import SPATIAL_DIM, arc_length_resample_strokes
 
 CLASS_NAMES = [
     "FLUENT_DERIVATION",
@@ -35,7 +34,7 @@ CLASS_NAMES = [
 ]
 
 LABEL_TO_CLASS: Dict[str, int] = {name: idx for idx, name in enumerate(CLASS_NAMES)}
-DYNAMICS_DIM = 10
+DYNAMICS_DIM = 14
 STROKE_MAX_PTS = 24
 WINDOW_STEPS = 20
 
@@ -44,9 +43,9 @@ WINDOW_STEPS = 20
 class StrokeWindowSample:
     """单次卡壳决策窗口的双流对齐张量与监督标签。"""
 
-    stroke_spatial_seqs: np.ndarray  # [W, L_s, 6] 每一决策步的等弧长几何笔迹
-    spatial_seq: np.ndarray          # [L_expr, 6] 整体窗口表达式几何流
-    dynamics_seq: np.ndarray         # [W, 10] 笔画步级非线性动力学流
+    stroke_spatial_seqs: np.ndarray  # [W, L_s, 10] 每一决策步的等弧长几何笔迹
+    spatial_seq: np.ndarray          # [L_expr, 10] 整体窗口表达式几何流
+    dynamics_seq: np.ndarray         # [W, 14] 笔画步级动力学 + 图谱状态流
     label_id: int
     label_name: str
     writer_profile: str
@@ -71,25 +70,26 @@ def extract_stroke_segment_dynamics(
     baseline_pause_log_std: float = 0.70,
     baseline_speed_px_sec: float = 160.0,
     alignment_trace: Optional[Sequence[float]] = None,
+    graph_trace: Optional[Sequence[Tuple[float, float, float, float]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     将原始笔画列表转为“决策步级对齐”的双流特征：
     返回:
-      per_stroke_spatial: [N_strokes, STROKE_MAX_PTS, 6]
-      dynamics_steps:     [N_strokes, 10]
+      per_stroke_spatial: [N_strokes, STROKE_MAX_PTS, 10]
+      dynamics_steps:     [N_strokes, 14]
       stroke_end_times:   [N_strokes]
       stroke_raw_meta:    [N_strokes, 3] -> (raw_pause_ms, boundary_flag, erase_flag)
     """
     n_strokes = len(strokes)
     if n_strokes == 0:
         return (
-            np.zeros((1, STROKE_MAX_PTS, 6), dtype=np.float32),
+            np.zeros((1, STROKE_MAX_PTS, SPATIAL_DIM), dtype=np.float32),
             np.zeros((1, DYNAMICS_DIM), dtype=np.float32),
             np.zeros((1,), dtype=np.int64),
             np.zeros((1, 3), dtype=np.float32),
         )
 
-    per_stroke_spatial = np.zeros((n_strokes, STROKE_MAX_PTS, 6), dtype=np.float32)
+    per_stroke_spatial = np.zeros((n_strokes, STROKE_MAX_PTS, SPATIAL_DIM), dtype=np.float32)
     dynamics_steps = np.zeros((n_strokes, DYNAMICS_DIM), dtype=np.float32)
     stroke_end_times = np.zeros((n_strokes,), dtype=np.int64)
     stroke_raw_meta = np.zeros((n_strokes, 3), dtype=np.float32)
@@ -111,7 +111,6 @@ def extract_stroke_segment_dynamics(
         pause_before = max(0.0, float(t_start - prev_end_t)) if prev_end_t is not None else 0.0
         dt_since_prev = pause_before + dur_ms
 
-        # 物理长度、真实速度与笔内速度波动（完全脱离 60Hz/120Hz 硬件帧率依赖）
         arc_len = 0.0
         seg_speeds: List[float] = []
         xs = [float(pts[0]["x"])]
@@ -134,7 +133,6 @@ def extract_stroke_segment_dynamics(
             else 0.0
         )
 
-        # 个人对数停顿 Z 分数（非线性压缩长尾停顿）
         pause_ref = max(pause_before, 120.0)
         pause_z = (
             float(max(-2.5, min(4.0, (math.log(pause_ref) - baseline_pause_log_mean) / max(0.35, baseline_pause_log_std))))
@@ -142,7 +140,6 @@ def extract_stroke_segment_dynamics(
             else -1.0
         )
 
-        # 逻辑/微积分/线代边界几何初筛（辅助基准评测）
         bw = max(1.0, max(xs) - min(xs))
         bh = max(1.0, max(ys) - min(ys))
         is_horiz = bw > bh * 3.2 and bw >= 16.0
@@ -151,7 +148,6 @@ def extract_stroke_segment_dynamics(
 
         is_frag = 1.0 if (not is_eraser and arc_len < 18.0 and dur_ms < 220.0) else 0.0
 
-        # 多时间常数指数衰减积分（替代原始绝对时间戳）
         decay_pause = decay_pause * math.exp(-dt_since_prev / 1500.0) + max(0.0, pause_z)
         decay_erase = decay_erase * math.exp(-dt_since_prev / 10000.0) + (is_eraser + 0.35 * is_frag)
 
@@ -161,6 +157,10 @@ def extract_stroke_segment_dynamics(
         )
 
         align_a = float(alignment_trace[j]) if alignment_trace and j < len(alignment_trace) else 0.0
+        if graph_trace and j < len(graph_trace):
+            a_gap, st_stag, adv_pulse, st_prog = graph_trace[j]
+        else:
+            a_gap, st_stag, adv_pulse, st_prog = (0.35, 0.0, 0.0, min(1.0, (j + 1) / max(1.0, float(n_strokes))))
 
         dynamics_steps[j] = [
             min(1.5, math.log1p(dur_ms) / 8.0),
@@ -173,10 +173,14 @@ def extract_stroke_segment_dynamics(
             math.tanh(decay_pause / 2.5),
             math.tanh(decay_erase / 2.5),
             max(-1.0, min(1.0, align_a)),
+            max(0.0, min(1.0, a_gap)),
+            max(0.0, min(1.0, st_stag)),
+            max(0.0, min(1.0, adv_pulse)),
+            max(0.0, min(1.0, st_prog)),
         ]
 
         xy = [(float(p["x"]), float(p["y"])) for p in pts]
-        sp = arc_length_resample_strokes([xy], max_len=STROKE_MAX_PTS)
+        sp = arc_length_resample_strokes([xy], max_len=STROKE_MAX_PTS, spatial_dim=SPATIAL_DIM)
         copy_n = min(len(sp), STROKE_MAX_PTS)
         per_stroke_spatial[j, :copy_n] = sp[:copy_n]
 
@@ -199,7 +203,7 @@ def convert_session_to_windows(
     window_steps: int = WINDOW_STEPS,
     writer_profile: str = "real_user",
 ) -> List[StrokeWindowSample]:
-    """将导出的 v2.0-annotated / v1 会话切分为 6 类认知状态训练/验证窗口。"""
+    """将导出的 v2.0-annotated 会话切分为 6 类认知状态训练/验证窗口（含 14 维图谱状态特征）。"""
     strokes = session.get("strokes", [])
     annotations = session.get("annotations", [])
     cognitive_meta = session.get("cognitiveSession", {})
@@ -213,12 +217,19 @@ def convert_session_to_windows(
 
     state_trace = session.get("stateTrace") or cognitive_meta.get("stateTrace") or []
     align_per_stroke: List[float] = []
+    graph_per_stroke: List[Tuple[float, float, float, float]] = []
     if state_trace:
         for s in strokes:
             pts = s.get("points", [])
             t_end = int(pts[-1]["t"]) if pts else 0
             closest = min(state_trace, key=lambda item: abs(int(item.get("t", 0)) - t_end))
             align_per_stroke.append(float(closest.get("A", 0.0)))
+            graph_per_stroke.append((
+                float(closest.get("anchorGap", 0.35)),
+                float(closest.get("stepStagnation", 0.0)),
+                float(closest.get("stepAdvancePulse", 0.0)),
+                float(closest.get("stepProgress", 0.2)),
+            ))
 
     per_stroke_sp, dyn_steps, stroke_ts, raw_meta = extract_stroke_segment_dynamics(
         strokes,
@@ -226,6 +237,7 @@ def convert_session_to_windows(
         baseline_pause_log_std=log_std,
         baseline_speed_px_sec=base_speed,
         alignment_trace=align_per_stroke if align_per_stroke else None,
+        graph_trace=graph_per_stroke if graph_per_stroke else None,
     )
     if len(stroke_ts) < 2:
         return []
@@ -260,7 +272,7 @@ def convert_session_to_windows(
             for s in strokes[start_step:end_step]
             if s.get("tool") != "eraser" and s.get("points")
         ]
-        expr_spatial = arc_length_resample_strokes(win_xy, max_len=64)
+        expr_spatial = arc_length_resample_strokes(win_xy, max_len=64, spatial_dim=SPATIAL_DIM)
 
         tail_meta = raw_meta[max(start_step, end_step - 4) : end_step]
         tail_dyn = win_dyn[-min(4, window_steps) :]
@@ -270,7 +282,6 @@ def convert_session_to_windows(
         else:
             raw_pause_ms = float(ann.get("durationMs") or float(np.max(tail_meta[:, 0])))
 
-        # 如果是逻辑边界后长停顿，在发生停顿的后一笔前表现为前序笔存在 boundary_flag
         bnd_window = raw_meta[max(start_step, end_step - 3) : end_step, 1]
         boundary_flag = float(np.max(bnd_window)) if len(bnd_window) > 0 else 0.0
         pause_z = float(np.max(tail_dyn[:, 1]))
@@ -311,7 +322,7 @@ def generate_synthetic_annotated_sessions(
     seed: int = 2026,
 ) -> List[Tuple[Dict[str, Any], str]]:
     """
-    生成覆盖 6 类大学数学做题状态的快慢手对比会话集（每个会话含 6 类场景，零未来泄漏、含真实边缘噪声）。
+    生成覆盖 6 类大学数学做题状态的快慢手对比会话集（同步附带 4 维图谱对照特征 stateTrace）。
     """
     rng = np.random.default_rng(seed)
     outputs: List[Tuple[Dict[str, Any], str]] = []
@@ -340,6 +351,7 @@ def generate_synthetic_annotated_sessions(
             dt_step: int,
             shape: str = "digit",
             jitter_speed: float = 0.0,
+            graph_vals: Tuple[float, float, float, float] = (0.2, 0.0, 0.0, 0.3),
         ) -> None:
             nonlocal t_cursor, stroke_id
             pts = []
@@ -356,86 +368,93 @@ def generate_synthetic_annotated_sessions(
                     vy = math.sin(k * 0.95) * 11.0 + float(rng.normal(0, 1.0))
                     dx_k = dx_step
                 x_cur += dx_k
-                pts.append({
-                    "x": round(x_cur, 2),
-                    "y": round(y + vy, 2),
-                    "t": int(t_cursor),
-                })
+                pts.append({"x": round(x_cur, 2), "y": round(y + vy, 2), "t": int(t_cursor)})
                 t_cursor += step_dt
             obj: Dict[str, Any] = {"id": stroke_id, "points": pts}
             if tool == "eraser":
                 obj["tool"] = "eraser"
             strokes.append(obj)
             stroke_id += 1
+            ag, ss, ap, sp_prog = graph_vals
+            state_trace.append({
+                "t": t_cursor,
+                "M": 0.65,
+                "R": 0.25,
+                "A": 0.35 if ss < 0.4 else -0.1,
+                "anchorGap": ag,
+                "stepStagnation": ss,
+                "stepAdvancePulse": ap,
+                "stepProgress": sp_prog,
+            })
 
-        # 类 0：FLUENT_DERIVATION（顺畅高速书写；12% 概率含一次轻微小修正噪声）
+        # 类 0：FLUENT_DERIVATION（低 anchorGap、步进脉冲正常跃迁）
         for b in range(5):
             t_cursor += int(personal_pause_ms * float(rng.uniform(0.55, 1.15)))
-            add_stroke("pen", 50 + b * 24, 100, 3.8 if not is_slow else 2.2, 8, 16)
+            add_stroke("pen", 50 + b * 24, 100, 3.8 if not is_slow else 2.2, 8, 16, graph_vals=(0.15, 0.05, 0.65 if b == 4 else 0.1, 0.33))
         if float(rng.random()) < 0.12:
             t_cursor += 160
-            add_stroke("eraser", 120, 100, 1.5, 4, 16)
+            add_stroke("eraser", 120, 100, 1.5, 4, 16, graph_vals=(0.18, 0.10, 0.0, 0.33))
             t_cursor += 140
-            add_stroke("pen", 120, 100, 3.4 if not is_slow else 2.1, 6, 16)
+            add_stroke("pen", 120, 100, 3.4 if not is_slow else 2.1, 6, 16, graph_vals=(0.12, 0.05, 0.45, 0.35))
         annotations.append({"id": "a0", "timestamp": t_cursor, "label": "FLUENT_DERIVATION", "source": "auto_fluent", "durationMs": 4800})
-        state_trace.append({"t": t_cursor, "M": 0.88, "R": 0.08, "A": 0.55})
+        state_trace[-1].update({"M": 0.88, "R": 0.08, "A": 0.55})
 
-        # 类 1：DEEP_THINKING_HOLD（健康心算：无涂改，前序动量稳，停顿可达 1.4x~2.3x 个人基线，20% 概率紧跟在等号后形成高难度歧义）
+        # 类 1：DEEP_THINKING_HOLD（步骤跃迁刚完成后自然审题停顿：stepAdvancePulse 高 + 无涂改）
         for b in range(3):
             t_cursor += int(personal_pause_ms * float(rng.uniform(0.65, 0.95)))
             ambig = (b == 2 and float(rng.random()) < 0.20)
-            add_stroke("pen", 60 + b * 24, 160, 3.6 if not is_slow else 2.2, 8, int(rng.integers(15, 20)), shape="eq" if ambig else "digit")
+            add_stroke("pen", 60 + b * 24, 160, 3.6 if not is_slow else 2.2, 8, int(rng.integers(15, 20)), shape="eq" if ambig else "digit", graph_vals=(0.18, 0.08, 0.85 if b == 2 else 0.2, 0.50))
         think_pause = int(personal_pause_ms * float(rng.uniform(1.4, 2.35)))
         t_cursor += think_pause
-        add_stroke("pen", 145, 160, 3.2 if not is_slow else 2.0, 6, 16)
+        add_stroke("pen", 145, 160, 3.2 if not is_slow else 2.0, 6, 16, graph_vals=(0.22, 0.12, 0.65, 0.52))
         annotations.append({"id": "a1", "timestamp": t_cursor, "label": "DEEP_THINKING_HOLD", "source": "user_tap_button", "durationMs": think_pause})
-        state_trace.append({"t": t_cursor, "M": 0.48, "R": 0.25, "A": 0.25})
+        state_trace[-1].update({"M": 0.48, "R": 0.25, "A": 0.30})
 
-        # 类 2：CALC_MICRO_HESITATION（微卡犹豫：单次小涂改或速率轻度晃动，停顿适中）
+        # 类 2：CALC_MICRO_HESITATION（微卡犹豫：中度 anchorGap + 轻微擦改）
         t_cursor += int(personal_pause_ms * float(rng.uniform(0.85, 1.15)))
-        add_stroke("pen", 80, 220, 2.0, 6, 22, jitter_speed=0.35)
+        add_stroke("pen", 80, 220, 2.0, 6, 22, jitter_speed=0.35, graph_vals=(0.38, 0.32, 0.05, 0.55))
         t_cursor += int(personal_pause_ms * float(rng.uniform(0.9, 1.45)))
-        add_stroke("eraser", 80, 220, 1.8, 5, 18)
+        add_stroke("eraser", 80, 220, 1.8, 5, 18, graph_vals=(0.40, 0.42, 0.0, 0.55))
         t_cursor += 280
-        add_stroke("pen", 82, 220, 2.4, 6, 18, jitter_speed=0.25)
+        add_stroke("pen", 82, 220, 2.4, 6, 18, jitter_speed=0.25, graph_vals=(0.35, 0.36, 0.05, 0.55))
         annotations.append({"id": "a2", "timestamp": t_cursor, "label": "CALC_MICRO_HESITATION", "source": "auto_fluent", "durationMs": int(personal_pause_ms * 1.15)})
-        state_trace.append({"t": t_cursor, "M": 0.42, "R": 0.48, "A": 0.10})
+        state_trace[-1].update({"M": 0.42, "R": 0.48, "A": 0.10})
 
-        # 类 3：STUCK_CALCULATION（算式/化简重度受阻：多次反复同区涂改 + 碎颤低速）
+        # 类 3：STUCK_CALCULATION（核心符号已在画布 anchorGap<=0.32，但同一步停滞擦写 stepStagnation>=0.75）
         t_cursor += int(personal_pause_ms * 1.1)
-        add_stroke("pen", 90, 280, 0.9, 6, 28, jitter_speed=0.45)
+        add_stroke("pen", 90, 280, 0.9, 6, 28, jitter_speed=0.45, graph_vals=(0.26, 0.62, 0.0, 0.62))
         t_cursor += int(personal_pause_ms * float(rng.uniform(1.4, 2.2)))
-        add_stroke("eraser", 90, 280, 1.4, 6, 20)
+        add_stroke("eraser", 90, 280, 1.4, 6, 20, graph_vals=(0.28, 0.78, 0.0, 0.62))
         t_cursor += 350
-        add_stroke("pen", 92, 280, 0.8, 4, 30, jitter_speed=0.45)
+        add_stroke("pen", 92, 280, 0.8, 4, 30, jitter_speed=0.45, graph_vals=(0.25, 0.82, 0.0, 0.62))
         t_cursor += 320
-        add_stroke("eraser", 92, 280, 1.5, 6, 20)
+        add_stroke("eraser", 92, 280, 1.5, 6, 20, graph_vals=(0.28, 0.88, 0.0, 0.62))
         t_cursor += int(rng.integers(300, 600))
-        add_stroke("pen", 95, 280, 0.85, 5, 29, jitter_speed=0.4)
+        add_stroke("pen", 95, 280, 0.85, 5, 29, jitter_speed=0.4, graph_vals=(0.24, 0.86, 0.0, 0.62))
         annotations.append({"id": "a3", "timestamp": t_cursor, "label": "STUCK_CALCULATION", "source": "user_tap_button", "durationMs": int(personal_pause_ms * 1.9)})
-        state_trace.append({"t": t_cursor, "M": 0.16, "R": 0.88, "A": -0.15})
+        state_trace[-1].update({"M": 0.16, "R": 0.88, "A": -0.15})
 
-        # 类 4：STUCK_CONCEPT_GAP（概念/思路卡壳：多在写下 ∫ 或 = 后伴随速率衰退与长停顿）
+        # 类 4：STUCK_CONCEPT_GAP（思路断链：anchorGap>=0.65 + 长停顿，缺少当前步骤关键算符）
         t_cursor += 500
         bnd_shape = "int" if float(rng.random()) < 0.5 else ("eq" if float(rng.random()) < 0.75 else "digit")
-        add_stroke("pen", 110, 350, 1.9 if not is_slow else 1.2, 8, int(rng.integers(26, 36)), shape=bnd_shape, jitter_speed=0.25)
+        add_stroke("pen", 110, 350, 1.9 if not is_slow else 1.2, 8, int(rng.integers(26, 36)), shape=bnd_shape, jitter_speed=0.25, graph_vals=(0.72, 0.68, 0.0, 0.25))
         concept_pause = int(personal_pause_ms * float(rng.uniform(2.05, 3.4)))
         t_cursor += concept_pause
-        add_stroke("pen", 145, 350, 1.5, 4, 24)
+        add_stroke("pen", 145, 350, 1.5, 4, 24, graph_vals=(0.76, 0.82, 0.0, 0.25))
         annotations.append({"id": "a4", "timestamp": t_cursor, "label": "STUCK_CONCEPT_GAP", "source": "user_tap_button", "durationMs": concept_pause})
-        state_trace.append({"t": t_cursor, "M": 0.14, "R": 0.86, "A": -0.10})
+        state_trace[-1].update({"M": 0.14, "R": 0.86, "A": -0.10})
 
-        # 类 5：DIRECTION_DRIFT_PITFALL（歧路偏离：连续写出错误变形且语义对齐 A(t) 跌至负区间 -0.65）
+        # 类 5：DIRECTION_DRIFT_PITFALL（歧路偏离：连续写出偏离符号且 A=-0.65）
         t_cursor += 500
-        add_stroke("pen", 100, 420, 3.2, 7, 17, shape="eq")
+        add_stroke("pen", 100, 420, 3.2, 7, 17, shape="eq", graph_vals=(0.55, 0.45, 0.0, 0.45))
         t_cursor += int(personal_pause_ms * 0.9)
-        add_stroke("pen", 130, 420, 2.8, 7, 18, shape="digit")
+        add_stroke("pen", 130, 420, 2.8, 7, 18, shape="digit", graph_vals=(0.62, 0.52, 0.0, 0.45))
         annotations.append({"id": "a5", "timestamp": t_cursor, "label": "DIRECTION_DRIFT_PITFALL", "source": "syntax_pitfall", "durationMs": 950})
-        state_trace.append({"t": t_cursor, "M": 0.58, "R": 0.62, "A": -0.65})
+        state_trace[-1].update({"M": 0.58, "R": 0.62, "A": -0.65})
 
         outputs.append((
             {
-                "meta": {"version": "2.0-annotated", "exportedAt": "2026-11-20T00:00:00.000Z", "problemId": f"syn6_{sess_idx:03d}", "strokeCount": len(strokes)},
+                "meta": {"version": "2.0-annotated", "exportedAt": "2026-11-24T00:00:00.000Z", "problemId": f"syn6_{sess_idx:03d}", "strokeCount": len(strokes)},
                 "strokes": strokes,
                 "stallEvents": [],
                 "annotations": annotations,

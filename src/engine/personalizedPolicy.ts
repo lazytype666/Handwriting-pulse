@@ -163,6 +163,9 @@ export interface PolicyContextInput {
   speedRatio: number;
   triggerKind: 'pause_erase' | 'speed_drop' | 'cognitive_stall';
   cognitiveCategory?: string;
+  anchorGap?: number;
+  stepStagnation?: number;
+  pitfallProb?: number;
 }
 
 /**
@@ -284,40 +287,48 @@ export class PersonalizedPolicyEngine {
 
   private computeColdStartPrior(style: HintStyle, input: PolicyContextInput): number {
     const cat = input.cognitiveCategory;
+    let bonus = 0;
+    if ((input.pitfallProb ?? 0) >= 0.55) {
+      if (style === 'sanity_check' || style === 'algebra_check') bonus += 0.14;
+    }
+    if ((input.anchorGap ?? 0) >= 0.5 && (input.stepStagnation ?? 0) >= 0.45) {
+      if (style === 'concept_recall' || style === 'step_decompose') bonus += 0.12;
+    }
+
     if (cat === 'CALC_MICRO_HESITATION' || cat === 'STUCK_CALCULATION') {
-      if (style === 'algebra_check') return 0.30;
-      if (style === 'sanity_check') return 0.25;
-      if (style === 'step_decompose') return 0.20;
-      return 0.08;
+      if (style === 'algebra_check') return 0.30 + bonus;
+      if (style === 'sanity_check') return 0.25 + bonus;
+      if (style === 'step_decompose') return 0.20 + bonus;
+      return 0.08 + bonus;
     }
     if (cat === 'DIRECTION_DRIFT_PITFALL') {
-      if (style === 'condition_reminder') return 0.30;
-      if (style === 'concept_recall') return 0.26;
-      if (style === 'socratic_question') return 0.18;
-      return 0.06;
+      if (style === 'condition_reminder') return 0.30 + bonus;
+      if (style === 'concept_recall') return 0.26 + bonus;
+      if (style === 'socratic_question') return 0.18 + bonus;
+      return 0.06 + bonus;
     }
     if (cat === 'STUCK_CONCEPT_GAP') {
-      if (style === 'socratic_question') return 0.28;
-      if (style === 'concept_recall') return 0.24;
-      if (style === 'condition_reminder') return 0.20;
-      return 0.10;
+      if (style === 'socratic_question') return 0.28 + bonus;
+      if (style === 'concept_recall') return 0.24 + bonus;
+      if (style === 'condition_reminder') return 0.20 + bonus;
+      return 0.10 + bonus;
     }
 
     if (input.triggerKind === 'pause_erase') {
-      if (style === 'algebra_check') return 0.28;
-      if (style === 'sanity_check') return 0.22;
-      if (style === 'condition_reminder') return 0.18;
-      return 0.12;
+      if (style === 'algebra_check') return 0.28 + bonus;
+      if (style === 'sanity_check') return 0.22 + bonus;
+      if (style === 'condition_reminder') return 0.18 + bonus;
+      return 0.12 + bonus;
     }
     if (input.triggerKind === 'speed_drop') {
-      if (style === 'step_decompose') return 0.26;
-      if (style === 'socratic_question') return 0.22;
-      return 0.12;
+      if (style === 'step_decompose') return 0.26 + bonus;
+      if (style === 'socratic_question') return 0.22 + bonus;
+      return 0.12 + bonus;
     }
-    if (style === 'socratic_question') return 0.24;
-    if (style === 'concept_recall') return 0.20;
-    if (style === 'condition_reminder') return 0.18;
-    return 0.12;
+    if (style === 'socratic_question') return 0.24 + bonus;
+    if (style === 'concept_recall') return 0.20 + bonus;
+    if (style === 'condition_reminder') return 0.18 + bonus;
+    return 0.12 + bonus;
   }
 
   public updateFromFeedback(params: {

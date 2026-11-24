@@ -4,7 +4,16 @@ import {
   type EdgeNeuralBundle,
   type QuantizedTensorSpec,
 } from './edgeNeuralWeights';
-import { decodeCtcBeamSearch, decodeCtcGreedy } from './mathVocab';
+import {
+  computeCtcTokenPosteriors,
+  decodeCtcBeamSearch,
+  decodeCtcGreedy,
+  EDGE_RELATIONS,
+  MATH_VOCAB_INDEX,
+  MATH_VOCAB_SIZE,
+  type CtcDecodeOptions,
+  type StrokeEdgeRelation,
+} from './mathVocab';
 
 export type CognitiveCategory =
   | 'FLUENT_DERIVATION'
@@ -35,6 +44,14 @@ export const COGNITIVE_CATEGORY_ZH: Record<CognitiveCategory, string> = {
 export interface NeuralMathOutput {
   recognizedLatex: string;
   semPooled: Float32Array;
+  /** 125 维 CTC 符号边缘后验概率 P_ctc(v) ∈ [0, 1] */
+  tokenPosteriors: Float32Array;
+}
+
+export interface StrokeEdgePrediction {
+  bestClass: number;
+  relation: StrokeEdgeRelation;
+  probs: number[];
 }
 
 export interface NeuralCognitiveOutput {
@@ -304,18 +321,141 @@ function gruForward(
   return outSeq;
 }
 
+const DELIM_VOCAB_TOKENS = new Set(['(', ')', '[', ']', '{', '}', '_', '^', ',', '.']);
+
+function tokenizeExprIntoIds(expr: string): number[] {
+  const ids: number[] = [];
+  let i = 0;
+  while (i < expr.length) {
+    const ch = expr[i];
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '$') {
+      i += 1;
+      continue;
+    }
+    if (ch === '\\') {
+      let j = i + 1;
+      while (j < expr.length && /[a-zA-Z]/.test(expr[j])) {
+        j += 1;
+      }
+      const cmd = expr.slice(i, j);
+      const id = MATH_VOCAB_INDEX.get(cmd);
+      if (id !== undefined && id > 0) {
+        ids.push(id);
+      }
+      i = Math.max(j, i + 1);
+      continue;
+    }
+    const id = MATH_VOCAB_INDEX.get(ch);
+    if (id !== undefined && id > 0) {
+      ids.push(id);
+    }
+    i += 1;
+  }
+  return ids;
+}
+
 /**
- * 与 Python `mathwriting_loader.py#arc_length_resample_strokes` 完全等价的零截断自适应等弧长 6 通道重采样。
+ * 构建解题图谱浅融合对数先验偏置向量（长度 125）。
+ * 根据当前步骤期望符号与题干数学式提高候选符号的 Beam Search 对数概率。
+ */
+export function buildProblemVocabPriorBias(
+  expectedTokens: string[],
+  stemLatexSegments: string[] = [],
+): Float32Array | undefined {
+  const bias = new Float32Array(MATH_VOCAB_SIZE);
+  let hasAny = false;
+
+  const applyTokens = (sources: string[], baseWeight: number, maxWeight: number) => {
+    for (const src of sources) {
+      if (!src) continue;
+      const directId = MATH_VOCAB_INDEX.get(src.trim());
+      if (directId !== undefined && directId > 0) {
+        const w = DELIM_VOCAB_TOKENS.has(src.trim()) ? baseWeight * 0.35 : baseWeight;
+        bias[directId] = Math.min(maxWeight, Math.max(bias[directId], w));
+        hasAny = true;
+        continue;
+      }
+      const subIds = tokenizeExprIntoIds(src);
+      for (const tid of subIds) {
+        if (tid <= 0) continue;
+        bias[tid] = Math.min(maxWeight, Math.max(bias[tid], baseWeight * 0.72));
+        hasAny = true;
+      }
+    }
+  };
+
+  applyTokens(expectedTokens, 0.72, 1.25);
+  applyTokens(stemLatexSegments, 0.36, 0.95);
+  bias[0] = 0;
+
+  return hasAny ? bias : undefined;
+}
+
+function strokeBbox(pts: Point[]): [number, number, number, number, number, number] {
+  let x0 = Infinity;
+  let x1 = -Infinity;
+  let y0 = Infinity;
+  let y1 = -Infinity;
+  for (const p of pts) {
+    if (p.x < x0) x0 = p.x;
+    if (p.x > x1) x1 = p.x;
+    if (p.y < y0) y0 = p.y;
+    if (p.y > y1) y1 = p.y;
+  }
+  const w = Math.max(1e-3, x1 - x0);
+  const h = Math.max(1e-3, y1 - y0);
+  return [x0, y0, w, h, x0 + 0.5 * w, y0 + 0.5 * h];
+}
+
+/**
+ * 与 Python `mathwriting_loader.py#extract_pair_geom_10` 逐维一致的 10 维尺度不变二维笔画对特征。
+ */
+export function extractPairGeom10(strokeA: Stroke, strokeB: Stroke, exprScale: number): Float32Array {
+  const out = new Float32Array(10);
+  if (strokeA.points.length === 0 || strokeB.points.length === 0) {
+    return out;
+  }
+  const s = Math.max(12, exprScale);
+  const [ax0, ay0, aw, ah, acx, acy] = strokeBbox(strokeA.points);
+  const [bx0, by0, bw, bh, bcx, bcy] = strokeBbox(strokeB.points);
+  const interX = Math.max(0, Math.min(ax0 + aw, bx0 + bw) - Math.max(ax0, bx0));
+  const interY = Math.max(0, Math.min(ay0 + ah, by0 + bh) - Math.max(ay0, by0));
+  const xOv = interX / Math.max(1e-3, Math.min(aw, bw));
+  const yOv = interY / Math.max(1e-3, Math.min(ah, bh));
+
+  const gapX = Math.max(0, bx0 - (ax0 + aw), ax0 - (bx0 + bw));
+  const gapY = Math.max(0, by0 - (ay0 + ah), ay0 - (by0 + bh));
+  const minDist = Math.hypot(gapX, gapY) / s;
+  const areaA = Math.max(1, aw * ah);
+  const areaB = Math.max(1, bw * bh);
+  const logArea = clamp(Math.log(areaB / areaA), -3, 3);
+
+  out[0] = clamp((bcx - acx) / s, -3, 3);
+  out[1] = clamp((bcy - acy) / s, -3, 3);
+  out[2] = clamp(aw / s, 0, 3);
+  out[3] = clamp(ah / s, 0, 3);
+  out[4] = clamp(bw / s, 0, 3);
+  out[5] = clamp(bh / s, 0, 3);
+  out[6] = clamp(xOv, 0, 1);
+  out[7] = clamp(yOv, 0, 1);
+  out[8] = clamp(minDist, 0, 3);
+  out[9] = logArea;
+  return out;
+}
+
+/**
+ * 与 Python `mathwriting_loader.py#arc_length_resample_strokes` 完全等价的零截断自适应等弧长重采样（支持 10 通道二维边框感知与 6 通道兼容）。
  */
 export function arcLengthResampleStrokesTS(
   strokes: Stroke[],
   stepNorm = 0.085,
   maxLen = 192,
   includeEraser = false,
+  spatialDim = 10,
 ): { data: Float32Array; seqLen: number } {
   const valid = strokes.filter(s => (includeEraser || s.tool !== 'eraser') && s.points.length >= 1);
   if (valid.length === 0) {
-    return { data: new Float32Array(6), seqLen: 1 };
+    return { data: new Float32Array(spatialDim), seqLen: 1 };
   }
 
   let minX = Infinity;
@@ -331,33 +471,66 @@ export function arcLengthResampleStrokesTS(
     }
   }
   const scale = Math.max(12, maxY - minY, 0.25 * (maxX - minX));
+  const normCenterX = (0.5 * (minX + maxX)) / scale;
   const normCenterY = (0.5 * (minY + maxY)) / scale;
 
-  const normStrokes: Array<{ pts: Point[]; cum: number[] }> = [];
+  const normStrokes: Array<{
+    pts: Point[];
+    cum: number[];
+    scx: number;
+    scy: number;
+    sw: number;
+    sh: number;
+  }> = [];
   let totalArcAll = 0;
   for (const s of valid) {
     const pts = s.points;
+    let sx0 = Infinity;
+    let sx1 = -Infinity;
+    let sy0 = Infinity;
+    let sy1 = -Infinity;
+    for (const p of pts) {
+      const nx = p.x / scale;
+      const ny = p.y / scale;
+      if (nx < sx0) sx0 = nx;
+      if (nx > sx1) sx1 = nx;
+      if (ny < sy0) sy0 = ny;
+      if (ny > sy1) sy1 = ny;
+    }
+    const scx = clamp(0.5 * (sx0 + sx1) - normCenterX, -2.5, 2.5);
+    const scy = clamp(0.5 * (sy0 + sy1) - normCenterY, -1.5, 1.5);
+    const sw = clamp(sx1 - sx0, 0, 3.0);
+    const sh = clamp(sy1 - sy0, 0, 3.0);
+
     const cum: number[] = [0];
     for (let i = 1; i < pts.length; i++) {
       const d = Math.hypot((pts[i].x - pts[i - 1].x) / scale, (pts[i].y - pts[i - 1].y) / scale);
       cum.push(cum[cum.length - 1] + d);
     }
     totalArcAll += cum[cum.length - 1];
-    normStrokes.push({ pts, cum });
+    normStrokes.push({ pts, cum, scx, scy, sw, sh });
   }
 
   const budget = Math.max(8, maxLen - normStrokes.length - 2);
   const effStep = totalArcAll > 1e-4 ? Math.max(stepNorm, totalArcAll / budget) : stepNorm;
 
-  const resampled: Array<{ x: number; y: number; pen: number }> = [];
-  for (const { pts, cum } of normStrokes) {
+  const resampled: Array<{
+    x: number;
+    y: number;
+    pen: number;
+    scx: number;
+    scy: number;
+    sw: number;
+    sh: number;
+  }> = [];
+  for (const { pts, cum, scx, scy, sw, sh } of normStrokes) {
     if (pts.length === 1) {
-      resampled.push({ x: pts[0].x / scale, y: pts[0].y / scale, pen: 0 });
+      resampled.push({ x: pts[0].x / scale, y: pts[0].y / scale, pen: 0, scx, scy, sw, sh });
       continue;
     }
     const totalLen = cum[cum.length - 1];
     if (totalLen < 1e-4) {
-      resampled.push({ x: pts[0].x / scale, y: pts[0].y / scale, pen: 0 });
+      resampled.push({ x: pts[0].x / scale, y: pts[0].y / scale, pen: 0, scx, scy, sw, sh });
       continue;
     }
     const nSteps = Math.max(2, Math.min(64, Math.ceil(totalLen / effStep) + 1));
@@ -374,7 +547,15 @@ export function arcLengthResampleStrokesTS(
       const alpha = s1 > s0 ? (targetS - s0) / Math.max(1e-6, s1 - s0) : 0;
       const rx = (p0.x + alpha * (p1.x - p0.x)) / scale;
       const ry = (p0.y + alpha * (p1.y - p0.y)) / scale;
-      resampled.push({ x: rx, y: ry, pen: idxT === nSteps - 1 ? 0 : 1 });
+      resampled.push({
+        x: rx,
+        y: ry,
+        pen: idxT === nSteps - 1 ? 0 : 1,
+        scx,
+        scy,
+        sw,
+        sh,
+      });
     }
     if (resampled.length >= maxLen) {
       resampled.length = maxLen;
@@ -383,7 +564,7 @@ export function arcLengthResampleStrokesTS(
   }
 
   const seqLen = Math.max(1, resampled.length);
-  const out = new Float32Array(seqLen * 6);
+  const out = new Float32Array(seqLen * spatialDim);
   for (let i = 0; i < resampled.length; i++) {
     const cur = resampled[i];
     const prev = i > 0 ? resampled[i - 1] : cur;
@@ -393,13 +574,19 @@ export function arcLengthResampleStrokesTS(
     const cosT = ds > 1e-6 ? dx / ds : 1;
     const sinT = ds > 1e-6 ? dy / ds : 0;
     const yRel = clamp(cur.y - normCenterY, -1.5, 1.5);
-    const off = i * 6;
+    const off = i * spatialDim;
     out[off] = dx;
     out[off + 1] = dy;
     out[off + 2] = cosT;
     out[off + 3] = sinT;
     out[off + 4] = cur.pen;
     out[off + 5] = yRel;
+    if (spatialDim >= 10) {
+      out[off + 6] = cur.scx;
+      out[off + 7] = cur.scy;
+      out[off + 8] = cur.sw;
+      out[off + 9] = cur.sh;
+    }
   }
   return { data: out, seqLen };
 }
@@ -407,7 +594,7 @@ export function arcLengthResampleStrokesTS(
 /**
  * 纯 TypeScript Float32Array 端侧双流神经网络引擎（Expo Go 无需额外原生库即可直接运行真实权重）。
  *
- * 【自研推理核】数值严格对齐 PyTorch `EdgeMathEncoder` 与 `CognitiveStateNet`。
+ * 【自研推理核】数值严格对齐 PyTorch `EdgeMathGraphNet` (10-ch + StrokeGraphEdgeHead) 与 14 维 `CognitiveStateNet`。
  */
 export class EdgeNeuralModelRunner {
   private readonly mathWeights = new Map<string, Float32Array>();
@@ -417,6 +604,11 @@ export class EdgeNeuralModelRunner {
   private readonly mathLayers: number;
   private readonly nHeads: number;
   private readonly maxSpatialLen: number;
+  private readonly spatialDim: number;
+  private readonly dynamicsDim: number;
+  private readonly edgeGeomDim: number;
+  private readonly edgeHiddenDim: number;
+  private readonly edgeClasses: number;
   private loaded = false;
 
   constructor(bundle: EdgeNeuralBundle = EDGE_NEURAL_BUNDLE) {
@@ -426,10 +618,15 @@ export class EdgeNeuralModelRunner {
     this.mathLayers = Math.max(1, Number(cfg.conformer_layers ?? 4));
     this.nHeads = Math.max(1, Number(cfg.n_heads ?? 4));
     this.maxSpatialLen = Math.max(32, Number(cfg.max_spatial_len ?? 192));
+    this.edgeGeomDim = Math.max(1, Number(cfg.edge_geom_dim ?? 10));
+    this.edgeHiddenDim = Math.max(8, Number(cfg.edge_hidden_dim ?? 48));
+    this.edgeClasses = Math.max(2, Number(cfg.edge_classes ?? 7));
 
     const mathKeys = Object.keys(bundle.mathEncoder);
     const cogKeys = Object.keys(bundle.cognitiveNet);
     if (mathKeys.length === 0 || cogKeys.length === 0) {
+      this.spatialDim = Number(cfg.spatial_in_dim ?? 10);
+      this.dynamicsDim = Number(cfg.dynamics_in_dim ?? 14);
       return;
     }
     for (const k of mathKeys) {
@@ -438,6 +635,10 @@ export class EdgeNeuralModelRunner {
     for (const k of cogKeys) {
       this.cogWeights.set(k, dequantizeTensor(bundle.cognitiveNet[k]));
     }
+    const stemW = this.mathWeights.get('stem.0.weight');
+    const dynW = this.cogWeights.get('dynamics_encoder.proj.0.weight');
+    this.spatialDim = stemW ? Math.max(6, Math.round(stemW.length / this.mathD)) : Number(cfg.spatial_in_dim ?? 10);
+    this.dynamicsDim = dynW ? Math.max(10, Math.round(dynW.length / this.cogD)) : Number(cfg.dynamics_in_dim ?? 14);
     this.loaded = this.mathWeights.has('stem.0.weight') && this.cogWeights.has('class_head.weight');
   }
 
@@ -447,6 +648,22 @@ export class EdgeNeuralModelRunner {
 
   public getMathEmbedDim(): number {
     return this.mathD;
+  }
+
+  public getSpatialDim(): number {
+    return this.spatialDim;
+  }
+
+  public getDynamicsDim(): number {
+    return this.dynamicsDim;
+  }
+
+  public hasEdgeHead(): boolean {
+    return (
+      this.loaded &&
+      this.mathWeights.has('edge_head.proj_u.weight') &&
+      this.mathWeights.has('edge_head.mlp_1.weight')
+    );
   }
 
   private mw(name: string): Float32Array {
@@ -466,15 +683,33 @@ export class EdgeNeuralModelRunner {
     maxLen = this.maxSpatialLen,
     includeEraser = false,
     decodeMode: 'beam' | 'greedy' | 'none' = 'beam',
+    decodeOptions?: CtcDecodeOptions,
   ): NeuralMathOutput {
     if (!this.loaded) {
-      return { recognizedLatex: '', semPooled: new Float32Array(this.mathD) };
+      return {
+        recognizedLatex: '',
+        semPooled: new Float32Array(this.mathD),
+        tokenPosteriors: new Float32Array(MATH_VOCAB_SIZE),
+      };
     }
-    const { data, seqLen } = arcLengthResampleStrokesTS(strokes, 0.085, maxLen, includeEraser);
+    const { data, seqLen } = arcLengthResampleStrokesTS(
+      strokes,
+      0.085,
+      maxLen,
+      includeEraser,
+      this.spatialDim,
+    );
     const D = this.mathD;
 
-    // 1. Stem: Linear(6->D) -> LayerNorm -> SiLU
-    const stemLin = linear(data, seqLen, 6, D, this.mw('stem.0.weight'), this.mw('stem.0.bias'));
+    // 1. Stem: Linear(spatialDim->D) -> LayerNorm -> SiLU
+    const stemLin = linear(
+      data,
+      seqLen,
+      this.spatialDim,
+      D,
+      this.mw('stem.0.weight'),
+      this.mw('stem.0.bias'),
+    );
     layerNorm(stemLin, seqLen, D, this.mw('stem.1.weight'), this.mw('stem.1.bias'), true);
     siluInPlace(stemLin);
 
@@ -488,7 +723,7 @@ export class EdgeNeuralModelRunner {
       this.mw('subsample.bias'),
     );
     siluInPlace(sub.out);
-    let h = layerNorm(sub.out, sub.outLen, D, this.mw('sub_norm.weight'), this.mw('sub_norm.bias'), true);
+    const h = layerNorm(sub.out, sub.outLen, D, this.mw('sub_norm.weight'), this.mw('sub_norm.bias'), true);
     const subLen = sub.outLen;
 
     // 3. 无参正弦位置编码（与 Python EdgeMathEncoder 逐维一致）
@@ -553,16 +788,22 @@ export class EdgeNeuralModelRunner {
     for (let d = 0; d < D; d++) semPooled[d] /= Math.max(1, subLen);
 
     if (decodeMode === 'none') {
-      return { recognizedLatex: '', semPooled };
+      return {
+        recognizedLatex: '',
+        semPooled,
+        tokenPosteriors: new Float32Array(MATH_VOCAB_SIZE),
+      };
     }
 
     const vocabSize = this.mw('ctc_head.bias').length;
     const ctcLogits = linear(zSemSeq, subLen, D, vocabSize, this.mw('ctc_head.weight'), this.mw('ctc_head.bias'));
+    const tokenPosteriors = computeCtcTokenPosteriors(ctcLogits, subLen, vocabSize);
 
     if (decodeMode === 'beam') {
       return {
-        recognizedLatex: decodeCtcBeamSearch(ctcLogits, subLen, vocabSize, 4, 6),
+        recognizedLatex: decodeCtcBeamSearch(ctcLogits, subLen, vocabSize, 4, 6, decodeOptions),
         semPooled,
+        tokenPosteriors,
       };
     }
 
@@ -580,7 +821,11 @@ export class EdgeNeuralModelRunner {
       predIds.push(bestId);
     }
 
-    return { recognizedLatex: decodeCtcGreedy(predIds), semPooled };
+    return {
+      recognizedLatex: decodeCtcGreedy(predIds),
+      semPooled,
+      tokenPosteriors,
+    };
   }
 
   /**
@@ -593,17 +838,98 @@ export class EdgeNeuralModelRunner {
     return this.inferMathStrokes([stroke], 24, true, 'none').semPooled;
   }
 
+  /**
+   * StrokeGraphEdgeHead 双线性笔画关系分类头（与 PyTorch `StrokeGraphEdgeHead` 逐维一致）。
+   * 预测 7 类二维关系：NONE / SAME_SYMBOL / RIGHT / ABOVE / BELOW / SUP / SUB。
+   */
+  public inferStrokeGraphEdges(
+    semA: Float32Array,
+    semB: Float32Array,
+    geom10: Float32Array,
+  ): StrokeEdgePrediction {
+    if (!this.hasEdgeHead()) {
+      return {
+        bestClass: 0,
+        relation: 'NONE',
+        probs: [1, 0, 0, 0, 0, 0, 0],
+      };
+    }
+    const semDim = this.mathD;
+    const hDim = this.edgeHiddenDim;
+    const gDim = this.edgeGeomDim;
+    const nCls = this.edgeClasses;
+
+    const u = linear(semA, 1, semDim, hDim, this.mw('edge_head.proj_u.weight'), this.mw('edge_head.proj_u.bias'));
+    const v = linear(semB, 1, semDim, hDim, this.mw('edge_head.proj_v.weight'), this.mw('edge_head.proj_v.bias'));
+
+    const feat = new Float32Array(hDim * 3 + gDim);
+    feat.set(u, 0);
+    feat.set(v, hDim);
+    for (let i = 0; i < hDim; i++) {
+      feat[hDim * 2 + i] = u[i] * v[i];
+    }
+    for (let i = 0; i < Math.min(gDim, geom10.length); i++) {
+      feat[hDim * 3 + i] = geom10[i];
+    }
+
+    const hidden = linear(
+      feat,
+      1,
+      hDim * 3 + gDim,
+      hDim,
+      this.mw('edge_head.mlp_0.weight'),
+      this.mw('edge_head.mlp_0.bias'),
+    );
+    siluInPlace(hidden);
+
+    const logits = linear(hidden, 1, hDim, nCls, this.mw('edge_head.mlp_1.weight'), this.mw('edge_head.mlp_1.bias'));
+    let maxLogit = -Infinity;
+    for (let c = 0; c < nCls; c++) {
+      if (logits[c] > maxLogit) maxLogit = logits[c];
+    }
+    const probs = new Array<number>(nCls);
+    let expSum = 0;
+    for (let c = 0; c < nCls; c++) {
+      probs[c] = Math.exp(logits[c] - maxLogit);
+      expSum += probs[c];
+    }
+    let bestClass = 0;
+    let bestProb = -1;
+    for (let c = 0; c < nCls; c++) {
+      probs[c] = Number((probs[c] / Math.max(1e-8, expSum)).toFixed(4));
+      if (probs[c] > bestProb) {
+        bestProb = probs[c];
+        bestClass = c;
+      }
+    }
+    const relation = (EDGE_RELATIONS[bestClass] as StrokeEdgeRelation) ?? 'NONE';
+    return { bestClass, relation, probs };
+  }
+
   public inferCognitiveWindow(
     dynamicsSteps: Float32Array,
     semStepSeq: Float32Array,
     winSteps: number,
   ): NeuralCognitiveOutput {
     const D = this.cogD;
-    // 1. CausalDynamicsEncoder: proj(10->D) -> LayerNorm -> SiLU -> 2-layer GRU
+    const targetDynDim = this.dynamicsDim;
+    const inRowDim = winSteps > 0 ? Math.max(1, Math.floor(dynamicsSteps.length / winSteps)) : targetDynDim;
+    let dynInput = dynamicsSteps;
+    if (inRowDim !== targetDynDim) {
+      dynInput = new Float32Array(winSteps * targetDynDim);
+      const copyCols = Math.min(inRowDim, targetDynDim);
+      for (let t = 0; t < winSteps; t++) {
+        for (let c = 0; c < copyCols; c++) {
+          dynInput[t * targetDynDim + c] = dynamicsSteps[t * inRowDim + c];
+        }
+      }
+    }
+
+    // 1. CausalDynamicsEncoder: proj(14->D) -> LayerNorm -> SiLU -> 2-layer GRU
     const proj = linear(
-      dynamicsSteps,
+      dynInput,
       winSteps,
-      10,
+      targetDynDim,
       D,
       this.cw('dynamics_encoder.proj.0.weight'),
       this.cw('dynamics_encoder.proj.0.bias'),

@@ -2,7 +2,6 @@ import * as FileSystem from 'expo-file-system/legacy';
 import {
   isLocalModelUrl,
   resolveChatEndpoint,
-  TIMEOUT_MS,
   type CompletionResponse,
 } from '../hints/safety';
 import { parseMathSegments } from '../utils/mathFormat';
@@ -25,6 +24,9 @@ export interface IngestedProblemResult {
   ocrSource?: 'text' | 'mlkit_local' | 'mlkit_llm_refined' | 'vlm_local' | 'vlm_cloud';
 }
 
+const COMMERCIAL_VLM_TIMEOUT_MS = 15000;
+const LOCAL_VLM_TIMEOUT_MS = 45000;
+
 const VLM_OCR_SYSTEM_PROMPT = [
   '你是大学数学试卷排版与公式识别助手。只提取图片中的数学题目完整文字与公式，输出规范的 Markdown + LaTeX 题干，绝不解题、不给出任何解答步骤或答案。',
   '行内公式用 $...$ 包裹，独立公式块用 $$...$$ 包裹；特别注意精准还原分式 \\frac{}{}、多重/曲线积分 \\iint/\\oint、极限下标 \\lim_{x \\to 0}、分段函数 \\begin{cases}...\\end{cases}、矩阵/行列式 \\begin{bmatrix}/\\begin{vmatrix}、偏导 \\partial、梯度 \\nabla 与希腊字母。',
@@ -44,7 +46,37 @@ function hashProblemText(text: string): string {
   return 'prob_' + (h >>> 0).toString(16).padStart(8, '0');
 }
 
-/** 对设备端 ML Kit OCR 的常见数学扁平化误差做零耗时启发式规整 */
+/** 统一解析视觉识题端点：支持单独 VLM 配置或与商用解题大模型共用 Base URL / API Key */
+export function resolveVlmConnection(): {
+  base: string;
+  apiKey?: string;
+  model: string;
+  isLocal: boolean;
+} | null {
+  const base = (
+    process.env.EXPO_PUBLIC_VLM_BASE_URL ??
+    process.env.EXPO_PUBLIC_LLM_BASE_URL ??
+    process.env.EXPO_PUBLIC_EDGE_LLM_URL
+  )
+    ?.trim()
+    .replace(/\/+$/, '');
+  const apiKey = (
+    process.env.EXPO_PUBLIC_VLM_API_KEY ?? process.env.EXPO_PUBLIC_LLM_API_KEY
+  )?.trim();
+  const explicitVlmModel = process.env.EXPO_PUBLIC_VLM_MODEL?.trim();
+  const sharedLlmModel = process.env.EXPO_PUBLIC_LLM_MODEL?.trim();
+  const model =
+    explicitVlmModel ||
+    (sharedLlmModel && /vl|vision|gemini|gpt-4|gpt-5|claude|qvq|multimodal/i.test(sharedLlmModel)
+      ? sharedLlmModel
+      : '');
+  if (!base || !model) return null;
+  const isLocal = isLocalModelUrl(base);
+  if (!isLocal && !apiKey) return null;
+  return { base, apiKey: apiKey || undefined, model, isLocal };
+}
+
+/** 对设备端 ML Kit OCR 的常见数学扁平化误差做零耗时启发式规整（仅无 VLM 纯离线分支使用） */
 export function heuristicNormalizeOcrMathText(rawText: string): string {
   return rawText
     .replace(/\r\n?/g, '\n')
@@ -76,10 +108,10 @@ export function parseLatexBlocks(rawText: string): ProblemContentBlock[] {
 /**
  * 题目多模态/结构化摄入适配器（实现 IProblemIngestorAdapter）。
  *
- * 【自研实现 + 兼容本地/云端 VLM & 端侧 OCR LaTeX 修整】
- * 1. 文本摄入：端侧完成 LaTeX 块结构拆解与离线示例题库对齐；
- * 2. 图像摄入：支持本地局域网 VLM（如 Ollama qwen2.5vl:3b，无需 API Key）与云端 VLM 提取 Markdown + LaTeX；
- *    若 VLM 不可用或超时且传入了设备端 ML Kit OCR 文本，自动无缝降级至本地 OCR 修整结果，不丢弃扫描成果。
+ * 【升级版商用 VLM 优先策略】
+ * 1. 图像摄入：支持与解题大模型共用同一商用 API（同一 Base URL + API Key），15s 云端超时 + 自动瞬断重试；
+ *    不再混入乱码 ML Kit hint，失败时保留裁剪图供一键重识而非污染输入框；
+ * 2. 文本摄入：端侧完成 LaTeX 块结构拆解与离线示例题库对齐。
  */
 export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
   public async ingestFromText(
@@ -98,15 +130,14 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
       problemText: cleaned,
       blocks,
       matchedSample,
-      confidence: ocrSource === 'text' ? 1.0 : 0.86,
+      confidence: ocrSource === 'text' ? 1.0 : 0.88,
       needsUserConfirm,
       ocrSource,
     };
   }
 
   /**
-   * 对手机端 rn-mlkit-ocr 输出的纯文本进行数学公式修补与结构化预处理；
-   * 若已接入本地数学小模型或云端模型则轻量精修 LaTeX，否则零耗时启发式规整。
+   * 对纯离线 `rn-mlkit-ocr` 文本（无 VLM 端点配置时）进行数学格式归一化。
    */
   public async refineOcrText(rawOcrText: string): Promise<IngestedProblemResult> {
     const normalized = heuristicNormalizeOcrMathText(rawOcrText);
@@ -114,45 +145,32 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
       return this.ingestFromText('', 'mlkit_local', true);
     }
 
-    const vlmModel = process.env.EXPO_PUBLIC_VLM_MODEL?.trim();
-    const vlmBase = (
-      process.env.EXPO_PUBLIC_VLM_BASE_URL ??
-      process.env.EXPO_PUBLIC_EDGE_LLM_URL ??
-      process.env.EXPO_PUBLIC_LLM_BASE_URL
-    )
-      ?.trim()
-      .replace(/\/+$/, '');
-    const vlmKey = (
-      process.env.EXPO_PUBLIC_VLM_API_KEY ?? process.env.EXPO_PUBLIC_LLM_API_KEY
-    )?.trim();
-    const isLocalVlm = Boolean(vlmBase && isLocalModelUrl(vlmBase));
-    const useVlmText = Boolean(vlmBase && vlmModel && (isLocalVlm || vlmKey));
-
+    const vlmConn = resolveVlmConnection();
     const edgeBase = process.env.EXPO_PUBLIC_EDGE_LLM_URL?.trim();
     const edgeModel = process.env.EXPO_PUBLIC_EDGE_LLM_MODEL?.trim() || 'qwen2-math:1.5b';
     const cloudBase = process.env.EXPO_PUBLIC_LLM_BASE_URL?.trim();
     const cloudKey = process.env.EXPO_PUBLIC_LLM_API_KEY?.trim();
     const cloudModel = process.env.EXPO_PUBLIC_LLM_MODEL?.trim();
 
-    const useEdge = !useVlmText && Boolean(edgeBase);
-    const useCloud = !useVlmText && !useEdge && Boolean(cloudBase && cloudKey && cloudModel);
+    const useEdge = !vlmConn && Boolean(edgeBase);
+    const useCloud = !vlmConn && !useEdge && Boolean(cloudBase && cloudKey && cloudModel);
     const looksMath = /[=+\-*/^_{}()|∫∑√λΦ]|lim|sin|cos|ln|det|矩阵|积分|概率/i.test(normalized);
 
-    if ((useVlmText || useEdge || useCloud) && looksMath) {
-      const targetBase = useVlmText ? vlmBase! : useEdge ? edgeBase! : cloudBase!;
-      const localMode = useVlmText ? isLocalVlm : useEdge;
+    if ((vlmConn || useEdge || useCloud) && looksMath) {
+      const targetBase = vlmConn ? vlmConn.base : useEdge ? edgeBase! : cloudBase!;
+      const localMode = vlmConn ? vlmConn.isLocal : useEdge;
       const endpoint = resolveChatEndpoint(targetBase, localMode);
-      const model = useVlmText ? vlmModel! : useEdge ? edgeModel : cloudModel!;
-      const authKey = useVlmText ? vlmKey : useCloud ? cloudKey : undefined;
+      const model = vlmConn ? vlmConn.model : useEdge ? edgeModel : cloudModel!;
+      const authKey = vlmConn ? vlmConn.apiKey : useCloud ? cloudKey : undefined;
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), localMode ? 10000 : 6000);
+      const timeout = setTimeout(() => controller.abort(), localMode ? 10000 : 8000);
       try {
         const res = await fetch(endpoint, {
           method: 'POST',
           signal: controller.signal,
           headers: {
             'Content-Type': 'application/json',
-            ...(!localMode && authKey ? { Authorization: 'Bearer ' + authKey } : {}),
+            ...(authKey ? { Authorization: 'Bearer ' + authKey } : {}),
           },
           body: JSON.stringify({
             model,
@@ -181,7 +199,6 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
               .replace(/```$/i, '')
               .replace(/^(?:输出|示例输出)[:：]\s*/i, '')
               .trim();
-            // 安全校验：修复后不应变成解题长文或包含 \boxed 答案
             if (
               repaired &&
               repaired.length <= Math.max(240, normalized.length * 2.4) &&
@@ -192,7 +209,7 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
           }
         }
       } catch {
-        // 精修失败或超时直接回退本地启发式归一化文本
+        // 离线兜底
       } finally {
         clearTimeout(timeout);
       }
@@ -205,24 +222,14 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
     imageUri: string,
     hintMlkitText?: string,
   ): Promise<IngestedProblemResult> {
-    const vlmBase = (
-      process.env.EXPO_PUBLIC_VLM_BASE_URL ??
-      process.env.EXPO_PUBLIC_EDGE_LLM_URL ??
-      process.env.EXPO_PUBLIC_LLM_BASE_URL
-    )
-      ?.trim()
-      .replace(/\/+$/, '');
-    const apiKey = (
-      process.env.EXPO_PUBLIC_VLM_API_KEY ?? process.env.EXPO_PUBLIC_LLM_API_KEY
-    )?.trim();
-    const model = process.env.EXPO_PUBLIC_VLM_MODEL?.trim();
-
-    const isLocalVlm = Boolean(vlmBase && isLocalModelUrl(vlmBase));
-    if (!vlmBase || !model || (!isLocalVlm && !apiKey)) {
+    const conn = resolveVlmConnection();
+    if (!conn) {
       if (hintMlkitText?.trim()) {
         return this.refineOcrText(hintMlkitText);
       }
-      throw new Error('未配置视觉识题环境变量（EXPO_PUBLIC_VLM_MODEL），请手动粘贴题干或使用预设示例。');
+      throw new Error(
+        '未配置视觉识题 API（请在 .env.local 配置 EXPO_PUBLIC_VLM_MODEL 与商用 LLM Base URL / API Key）。',
+      );
     }
 
     let dataUrl = imageUri.trim();
@@ -234,11 +241,8 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
       dataUrl = `data:image/${ext};base64,${base64}`;
     }
 
-    const endpoint = resolveChatEndpoint(vlmBase, isLocalVlm);
-    const timeoutMs = isLocalVlm ? 45000 : TIMEOUT_MS;
-    const promptHint = hintMlkitText?.trim()
-      ? `\n（端侧粗识别参考，可能有排版压扁误差，请以图像实际公式为准）：\n${hintMlkitText.trim()}`
-      : '';
+    const endpoint = resolveChatEndpoint(conn.base, conn.isLocal);
+    const timeoutMs = conn.isLocal ? LOCAL_VLM_TIMEOUT_MS : COMMERCIAL_VLM_TIMEOUT_MS;
 
     const requestVlmOnce = async (): Promise<IngestedProblemResult> => {
       const controller = new AbortController();
@@ -249,13 +253,13 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
           signal: controller.signal,
           headers: {
             'Content-Type': 'application/json',
-            ...(apiKey ? { Authorization: 'Bearer ' + apiKey } : {}),
+            ...(conn.apiKey ? { Authorization: 'Bearer ' + conn.apiKey } : {}),
           },
           body: JSON.stringify({
-            model,
+            model: conn.model,
             stream: false,
             temperature: 0.1,
-            max_tokens: 700,
+            max_tokens: 800,
             messages: [
               { role: 'system', content: VLM_OCR_SYSTEM_PROMPT },
               {
@@ -263,7 +267,7 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
                 content: [
                   {
                     type: 'text',
-                    text: `请识别图中数学题目的完整题干（只提取题目本身为 Markdown + LaTeX，不要解答）。${promptHint}`,
+                    text: '请精确识别图中数学题目的完整题干，输出 Markdown + LaTeX（公式用 $...$ 或 $$...$$ 包裹），不要解题或给提示。',
                   },
                   { type: 'image_url', image_url: { url: dataUrl } },
                 ],
@@ -272,7 +276,7 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
           }),
         });
         if (!response.ok) {
-          throw new Error(`题目图像识别服务返回状态 ${response.status}`);
+          throw new Error(`视觉识题 API 返回状态 ${response.status}`);
         }
         const completion = (await response.json()) as CompletionResponse;
         const rawContent = completion?.choices?.[0]?.message?.content;
@@ -286,12 +290,12 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
           .trim();
         const result = await this.ingestFromText(
           cleaned,
-          isLocalVlm ? 'vlm_local' : 'vlm_cloud',
+          conn.isLocal ? 'vlm_local' : 'vlm_cloud',
           true,
         );
         return {
           ...result,
-          confidence: 0.92,
+          confidence: conn.isLocal ? 0.92 : 0.96,
           needsUserConfirm: true,
         };
       } finally {
@@ -304,21 +308,20 @@ export class ProblemIngestorAdapter implements IProblemIngestorAdapter {
         return await requestVlmOnce();
       } catch (firstErr) {
         const msg = firstErr instanceof Error ? firstErr.message : String(firstErr);
-        const transient = /canceled|aborted|network request failed|timed out/i.test(msg);
-        if (isLocalVlm && transient) {
+        const transient = /canceled|aborted|network request failed|timed out|429|502|503|504/i.test(msg);
+        if (transient) {
           return await requestVlmOnce();
         }
         throw firstErr;
       }
     } catch (err) {
-      // VLM 失败或超时且有端侧 ML Kit 识别底稿时，无缝降级保留用户已拍摄的文本
-      if (hintMlkitText?.trim()) {
-        return this.refineOcrText(hintMlkitText);
-      }
+      // 商用 VLM 失败时不往输入框强塞乱码，而是报错并允许前端一键用已裁剪缓存图重发
       const msg = err instanceof Error ? err.message : String(err);
       if (/canceled|aborted|network request failed|timed out/i.test(msg)) {
         throw new Error(
-          '视觉识题请求超时或连接中断，请确认电脑 Ollama 已监听 0.0.0.0:11434 且热点连通后重试（也可能是首次冷加载耗时较长）。',
+          conn.isLocal
+            ? '本地视觉识题超时或连接中断，请确认 Ollama 服务及热点连通后点「用原裁剪图重识」。'
+            : '云端视觉识题请求超时或网络抖动（已自动重试一次），请点「用原裁剪图重识」或直接粘贴题目。',
         );
       }
       throw err;

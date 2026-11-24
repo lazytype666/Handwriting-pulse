@@ -1,6 +1,16 @@
 import type { Point, Stroke } from '../capture';
 import { REWRITE_RADIUS } from '../stalls/config';
-import { EdgeNeuralModelRunner } from './neuralRuntime';
+import type { GraphGeometricRole } from './graphLogits';
+import {
+  MATH_VOCAB_INDEX,
+  MATH_VOCAB_SIZE,
+  type CtcDecodeOptions,
+} from './mathVocab';
+import {
+  buildProblemVocabPriorBias,
+  EdgeNeuralModelRunner,
+  extractPairGeom10,
+} from './neuralRuntime';
 import type { SolutionCacheEntry, SolutionPitfallSpec } from './solutionCache';
 import type { IInkSyntaxEncoderAdapter } from './types';
 
@@ -59,6 +69,14 @@ export interface EncodedExpressionResult {
   alignmentScore: number;
   matchedStepIndex: number;
   hitPitfall: SolutionPitfallSpec | null;
+  /** 图二：解题图谱连续易错歧路触发概率 PitfallProb ∈ [0, 1] */
+  pitfallProb: number;
+  /** 图四：期待步骤关键锚点缺失缺口 AnchorGap ∈ [0, 1] */
+  anchorGap: number;
+  /** 图四：解题步骤归一化进度 StepProgress ∈ [0, 1] */
+  stepProgress: number;
+  /** 125 维融合边缘后验概率（CTC + 几何观测融合） */
+  tokenPosteriors?: Float32Array;
   activeLineCount: number;
   tokenCount: number;
   encoderMode: 'geometric_heuristic' | 'neural_quantized_ts' | 'neural_onnx';
@@ -523,20 +541,135 @@ function classifyCluster(cluster: StrokeMetrics[], lineHeight: number): StrokeSy
   };
 }
 
+function sigmoid(x: number): number {
+  return 1 / (1 + Math.exp(-clamp(x, -30, 30)));
+}
+
 /**
- * 端侧全大学数学手写语法编码与步骤对齐引擎（实现 IInkSyntaxEncoderAdapter）。
+ * Quote ① 二维拓扑规范化重排（Spatial Canonical Stroke Reordering）：
+ * 在送入 Conformer-CTC 前解除“回头补写分子、补写积分上限或局部修改”导致的时间乱序：
+ * 1) 检测宽水平分式线，归组为 [分子笔画] -> [分式线] -> [分母笔画]；
+ * 2) 检测高大竖直微积分主算符（如 ∫/∑），将贴靠其上下端的界限簇排序至主体之后；
+ * 3) 其余同级笔画按中心横坐标 x 从左到右重排。
+ */
+export function canonicalizeLineStrokesForNeural(strokes: Stroke[]): Stroke[] {
+  const valid = strokes.filter(s => s.tool !== 'eraser' && s.points.length >= 1);
+  if (valid.length <= 2) return valid;
+
+  const meta = valid.map((s, idx) => {
+    const m = measureStroke(s);
+    const pts = s.points;
+    const dxNet = Math.abs(pts[pts.length - 1].x - pts[0].x);
+    const dyNet = Math.abs(pts[pts.length - 1].y - pts[0].y);
+    const horiz = dxNet / Math.max(1, dxNet + dyNet);
+    const vert = dyNet / Math.max(1, dxNet + dyNet);
+    return {
+      idx,
+      stroke: s,
+      x0: m.bbox.x,
+      y0: m.bbox.y,
+      w: m.bbox.w,
+      h: m.bbox.h,
+      cx: m.cx,
+      cy: m.cy,
+      horiz,
+      vert,
+    };
+  });
+
+  const heights = meta.map(m => m.h).filter(h => h > 4 && h < 220).sort((a, b) => a - b);
+  const avgH = Math.max(14, heights.length > 0 ? heights[Math.floor(heights.length / 2)] : 36);
+  const used = new Set<number>();
+  const orderedGroups: Array<{ cx: number; indices: number[] }> = [];
+
+  for (const m of meta) {
+    if (m.horiz > 0.82 && m.w >= avgH * 0.85 && m.h <= Math.max(18, m.w * 0.35)) {
+      const nums: typeof meta = [];
+      const dens: typeof meta = [];
+      const bx0 = m.x0;
+      const bx1 = m.x0 + m.w;
+      const bcy = m.cy;
+      for (const o of meta) {
+        if (o.idx === m.idx || used.has(o.idx)) continue;
+        const ox0 = o.x0;
+        const ox1 = o.x0 + o.w;
+        const inter = Math.max(0, Math.min(bx1, ox1) - Math.max(bx0, ox0));
+        const xOv = inter / Math.max(1, Math.min(m.w, o.w));
+        if (xOv < 0.2) continue;
+        if (bcy - o.cy >= 3 && bcy - o.cy <= avgH * 1.75) {
+          nums.push(o);
+        } else if (o.cy - bcy >= 3 && o.cy - bcy <= avgH * 1.75) {
+          dens.push(o);
+        }
+      }
+      if (nums.length > 0 && dens.length > 0) {
+        used.add(m.idx);
+        nums.forEach(o => used.add(o.idx));
+        dens.forEach(o => used.add(o.idx));
+        nums.sort((a, b) => a.cx - b.cx || a.idx - b.idx);
+        dens.sort((a, b) => a.cx - b.cx || a.idx - b.idx);
+        orderedGroups.push({
+          cx: m.cx,
+          indices: [...nums.map(k => k.idx), m.idx, ...dens.map(k => k.idx)],
+        });
+      }
+    }
+  }
+
+  for (const m of meta) {
+    if (used.has(m.idx)) continue;
+    if (m.h >= avgH * 1.3 && m.vert > 0.55 && m.w <= m.h * 0.75) {
+      const lows: typeof meta = [];
+      const highs: typeof meta = [];
+      for (const o of meta) {
+        if (o.idx === m.idx || used.has(o.idx)) continue;
+        if (o.h < avgH * 0.95 && Math.abs(o.cx - (m.cx + m.w * 0.35)) <= avgH * 1.2) {
+          if (o.cy >= m.cy + m.h * 0.2) lows.push(o);
+          else if (o.cy <= m.cy - m.h * 0.2) highs.push(o);
+        }
+      }
+      if (lows.length > 0 || highs.length > 0) {
+        used.add(m.idx);
+        lows.forEach(o => used.add(o.idx));
+        highs.forEach(o => used.add(o.idx));
+        lows.sort((a, b) => a.cx - b.cx || a.idx - b.idx);
+        highs.sort((a, b) => a.cx - b.cx || a.idx - b.idx);
+        orderedGroups.push({
+          cx: m.cx,
+          indices: [m.idx, ...lows.map(k => k.idx), ...highs.map(k => k.idx)],
+        });
+      }
+    }
+  }
+
+  for (const m of meta) {
+    if (!used.has(m.idx)) {
+      orderedGroups.push({ cx: m.cx, indices: [m.idx] });
+    }
+  }
+
+  orderedGroups.sort((a, b) => a.cx - b.cx || a.indices[0] - b.indices[0]);
+  const reordered: Stroke[] = [];
+  for (const grp of orderedGroups) {
+    for (const idx of grp.indices) {
+      reordered.push(valid[idx]);
+    }
+  }
+  return reordered;
+}
+
+/**
+ * 端侧全大学数学手写语法编码与图谱概率对齐引擎（实现 IInkSyntaxEncoderAdapter）。
  *
  * 【自研实现】设计思路：
- * 1. 覆盖高等数学（\int, \oint, \sum, \prod, \partial, \nabla, \infty, \to, \lim）、
- *    线性代数（矩阵/行列式跨行界定符与二维块、转置/逆矩阵上标 ^T/^{-1}、下标 _{ij}）
- *    与概率统计（~, \Phi, \cap, \cup, \varnothing, \bar{X} 上划线, P(A|B)）常见符号及二维布局；
- * 2. 在逻辑算符与边界锚点（=, \Rightarrow, \int, \sum, \to, \frac, |matrix|）后出现停顿时放大结构惊奇度权重，
- *    而在普通操作数（数字/变量）书写中途降低惊奇权重，避免干扰深度心算；
- * 3. 与解题图谱（SolutionCacheEntry）执行步骤对齐（A(t)）与易错歧路扫描（如阶数不够、漏讨论 |A|=0、条件概率分子分母颠倒）。
+ * 1. Quote ①：空间拓扑重排 `canonicalizeLineStrokesForNeural` 消除补写时间乱序；
+ * 2. Quote ②③：10 通道 `EdgeMathGraphNet` + `StrokeGraphEdgeHead` 辅助多笔聚簇/二维关系判别 + TAMER 语法栈束搜索 & 题谱先验浅融合；
+ * 3. 图二/图四：`evaluateGraphLogitHeads` 用每题动态 `stepLogits` / `pitfallLogits` 连续计算 `alignmentScore`、`pitfallProb`、`anchorGap` 与 `stepProgress`。
  */
 export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
   private neuralAdapter: IInkSyntaxEncoderAdapter | null = null;
   private neuralRunner: EdgeNeuralModelRunner | null = null;
+  private strokeSemCache = new Map<number, { ptCount: number; emb: Float32Array }>();
 
   public setNeuralEncoder(adapter: IInkSyntaxEncoderAdapter | null): void {
     this.neuralAdapter = adapter;
@@ -544,14 +677,28 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
 
   public setNeuralRunner(runner: EdgeNeuralModelRunner | null): void {
     this.neuralRunner = runner;
+    this.strokeSemCache.clear();
   }
 
   private getRunner(): EdgeNeuralModelRunner {
     return this.neuralRunner ?? getSharedNeuralRunner();
   }
 
+  private getCachedStrokeSem(stroke: Stroke, runner: EdgeNeuralModelRunner): Float32Array {
+    const hit = this.strokeSemCache.get(stroke.id);
+    if (hit && hit.ptCount === stroke.points.length) {
+      return hit.emb;
+    }
+    const emb = runner.inferSingleStrokeSemantic(stroke);
+    if (this.strokeSemCache.size >= 180) {
+      this.strokeSemCache.clear();
+    }
+    this.strokeSemCache.set(stroke.id, { ptCount: stroke.points.length, emb });
+    return emb;
+  }
+
   public encodeSingleStrokeSemantic(stroke: Stroke): Float32Array {
-    return this.getRunner().inferSingleStrokeSemantic(stroke);
+    return this.getCachedStrokeSem(stroke, this.getRunner());
   }
 
   public isLoaded(): boolean {
@@ -570,11 +717,25 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
     };
   }
 
+  private buildDecodeOptionsForSolution(solution: SolutionCacheEntry | null): CtcDecodeOptions {
+    if (!solution) {
+      return { enforceGrammar: true };
+    }
+    const expectedTokens = solution.steps.flatMap(s => s.expectedTokens ?? []);
+    const stemTokens =
+      solution.problemText.match(
+        /\\(?:frac|sqrt|int|oint|sum|prod|partial|nabla|lim|to|det|matrix|lambda|alpha|beta|Phi)|\|A\|/g,
+      ) ?? [];
+    const priorLogitBias = buildProblemVocabPriorBias(expectedTokens, stemTokens);
+    return { priorLogitBias, enforceGrammar: true };
+  }
+
   public async encodeWithSolution(
     rawStrokes: Stroke[],
     solution: SolutionCacheEntry | null,
   ): Promise<EncodedExpressionResult> {
     const visible = filterVisiblePenStrokes(rawStrokes);
+    const runner = this.getRunner();
     if (visible.length === 0) {
       return {
         recognizedLatex: '',
@@ -584,81 +745,98 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
         alignmentScore: 0,
         matchedStepIndex: -1,
         hitPitfall: null,
+        pitfallProb: 0,
+        anchorGap: 0,
+        stepProgress: 0,
         activeLineCount: 0,
         tokenCount: 0,
-        encoderMode: this.getRunner().isLoaded() ? 'neural_quantized_ts' : 'geometric_heuristic',
+        encoderMode: runner.isLoaded() ? 'neural_quantized_ts' : 'geometric_heuristic',
       };
     }
 
+    const parsed = this.segmentAndClassify(visible, runner);
+    const targetStrokes =
+      parsed.lineCount >= 2 && !parsed.hasMatrixLayout && parsed.activeLineStrokes.length > 0
+        ? parsed.activeLineStrokes
+        : visible;
+    const recentWindow = targetStrokes.length > 32 ? targetStrokes.slice(-32) : targetStrokes;
+    const canonicalWindow = canonicalizeLineStrokesForNeural(recentWindow);
+    const decodeOptions = this.buildDecodeOptionsForSolution(solution);
+
+    let recognizedLatex = parsed.latex;
+    let encoderMode: EncodedExpressionResult['encoderMode'] = 'geometric_heuristic';
+    let tokenPosteriors: Float32Array | undefined;
+    let externalAlignScore = 0;
+    let hasExternalAlign = false;
+
     if (this.neuralAdapter?.isLoaded()) {
       try {
-        const neural = await this.neuralAdapter.encodeRecentStrokes(visible);
-        const tokens = this.segmentAndClassify(visible);
-        const aligned = this.alignTokensWithSolution(
-          neural.recognizedLatex,
-          tokens.tokens,
-          tokens.lineCount,
-          tokens.hasMatrixLayout,
-          solution,
-        );
-        return {
-          recognizedLatex: neural.recognizedLatex,
-          structuralRole: tokens.latestRole,
-          detectedDomain: tokens.detectedDomain,
-          structuralBoundaryFactor: tokens.boundaryFactor,
-          alignmentScore: clamp((neural.alignmentScore + aligned.alignmentScore) / 2, -1, 1),
-          matchedStepIndex: aligned.matchedStepIndex,
-          hitPitfall: aligned.hitPitfall,
-          activeLineCount: tokens.lineCount,
-          tokenCount: tokens.tokens.length,
-          encoderMode: 'neural_onnx',
-        };
+        if (this.neuralAdapter.encodeRecentStrokesDetailed) {
+          const neural = await this.neuralAdapter.encodeRecentStrokesDetailed(
+            canonicalWindow,
+            decodeOptions,
+          );
+          if (neural.recognizedLatex.trim().length > 0) {
+            recognizedLatex = neural.recognizedLatex.trim();
+          }
+          tokenPosteriors = neural.tokenPosteriors;
+          externalAlignScore = neural.alignmentScore;
+          hasExternalAlign = true;
+        } else {
+          const neural = await this.neuralAdapter.encodeRecentStrokes(canonicalWindow);
+          if (neural.recognizedLatex.trim().length > 0) {
+            recognizedLatex = neural.recognizedLatex.trim();
+          }
+          externalAlignScore = neural.alignmentScore;
+          hasExternalAlign = true;
+        }
+        encoderMode = 'neural_onnx';
       } catch {
         // 外部 ONNX 适配器不可用时回退至内置量化模型或几何解码器
       }
     }
 
-    const parsed = this.segmentAndClassify(visible);
-    const runner = this.getRunner();
-    let recognizedLatex = parsed.latex;
-    let encoderMode: EncodedExpressionResult['encoderMode'] = 'geometric_heuristic';
-
-    if (runner.isLoaded()) {
-      const targetStrokes =
-        parsed.lineCount >= 2 && !parsed.hasMatrixLayout && parsed.activeLineStrokes.length > 0
-          ? parsed.activeLineStrokes
-          : visible;
-      const recentWindow = targetStrokes.length > 32 ? targetStrokes.slice(-32) : targetStrokes;
-      const neuralOut = runner.inferMathStrokes(recentWindow, 192);
+    if (encoderMode === 'geometric_heuristic' && runner.isLoaded()) {
+      const neuralOut = runner.inferMathStrokes(canonicalWindow, 192, false, 'beam', decodeOptions);
       if (neuralOut.recognizedLatex.trim().length > 0) {
         recognizedLatex = neuralOut.recognizedLatex.trim();
       }
+      tokenPosteriors = neuralOut.tokenPosteriors;
       encoderMode = 'neural_quantized_ts';
     }
 
-    const aligned = this.alignTokensWithSolution(
+    const aligned = this.evaluateGraphLogitHeads(
       recognizedLatex,
-      parsed.tokens,
-      parsed.lineCount,
-      parsed.hasMatrixLayout,
+      parsed,
+      tokenPosteriors,
       solution,
     );
+    const finalAlign = hasExternalAlign
+      ? clamp((externalAlignScore + aligned.alignmentScore) / 2, -1, 1)
+      : aligned.alignmentScore;
 
     return {
       recognizedLatex,
       structuralRole: parsed.latestRole,
       detectedDomain: parsed.detectedDomain,
       structuralBoundaryFactor: parsed.boundaryFactor,
-      alignmentScore: aligned.alignmentScore,
+      alignmentScore: Number(finalAlign.toFixed(2)),
       matchedStepIndex: aligned.matchedStepIndex,
       hitPitfall: aligned.hitPitfall,
+      pitfallProb: aligned.pitfallProb,
+      anchorGap: aligned.anchorGap,
+      stepProgress: aligned.stepProgress,
+      tokenPosteriors: aligned.obsPosteriors,
       activeLineCount: parsed.lineCount,
       tokenCount: parsed.tokens.length,
       encoderMode,
     };
   }
 
-  private segmentAndClassify(visibleStrokes: Stroke[]): {
+  private segmentAndClassify(
+    visibleStrokes: Stroke[],
+    runner?: EdgeNeuralModelRunner,
+  ): {
     latex: string;
     tokens: StrokeSymbolToken[];
     lineCount: number;
@@ -667,6 +845,7 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
     hasMatrixLayout: boolean;
     boundaryFactor: number;
     activeLineStrokes: Stroke[];
+    graphEdgeHits: { hasAboveBelow: boolean; hasSupSub: boolean; wideFracCount: number };
   } {
     const metrics = visibleStrokes.map(measureStroke);
     const normalHeights = metrics
@@ -746,12 +925,39 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
 
     lines.sort((a, b) => mergeBbox(a.map(x => x.bbox)).y - mergeBbox(b.map(x => x.bbox)).y);
 
-    // 3. 行内符号聚类 + 上下标/均值上划线二维关系修饰
+    // 4. 行内符号聚类（融合 Quote ③ StrokeGraphEdgeHead 成对神经图关系边）+ 上下标/均值修饰
     const allTokens: StrokeSymbolToken[] = [];
     const lineStrings: string[] = [];
+    let hasAboveBelow = wideFracBars.length > 0;
+    let hasSupSub = false;
+    const useEdgeHead = Boolean(runner && runner.hasEdgeHead());
 
     for (const line of lines) {
       const sorted = [...line].sort((a, b) => a.cx - b.cx);
+      const sameSymbolPairs = new Set<string>();
+
+      if (useEdgeHead && runner && sorted.length >= 2 && sorted.length <= 48) {
+        const sems = sorted.map(item => this.getCachedStrokeSem(item.stroke, runner));
+        for (let i = 0; i < sorted.length; i++) {
+          const maxJ = Math.min(sorted.length - 1, i + 3);
+          for (let j = i + 1; j <= maxJ; j++) {
+            const pred = runner.inferStrokeGraphEdges(
+              sems[i],
+              sems[j],
+              extractPairGeom10(sorted[i].stroke, sorted[j].stroke, avgHeight),
+            );
+            if (pred.relation === 'SAME_SYMBOL' && (pred.probs[1] ?? 0) >= 0.48) {
+              sameSymbolPairs.add(`${sorted[i].stroke.id}:${sorted[j].stroke.id}`);
+              sameSymbolPairs.add(`${sorted[j].stroke.id}:${sorted[i].stroke.id}`);
+            } else if (pred.relation === 'ABOVE' || pred.relation === 'BELOW') {
+              hasAboveBelow = true;
+            } else if (pred.relation === 'SUP' || pred.relation === 'SUB') {
+              hasSupSub = true;
+            }
+          }
+        }
+      }
+
       const clusters: StrokeMetrics[][] = [];
       for (const m of sorted) {
         let joined = false;
@@ -760,14 +966,15 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
           const cBox = mergeBbox(cluster.map(x => x.bbox));
           const gapX = Math.max(m.bbox.x - (cBox.x + cBox.w), cBox.x - (m.bbox.x + m.bbox.w));
           const overlapX = xOverlapRatio(cBox, m.bbox) > 0.25;
+          const lastInCluster = cluster[cluster.length - 1];
           const timeNear =
             Math.abs(
-              m.stroke.points[0].t -
-                cluster[cluster.length - 1].stroke.points[
-                  cluster[cluster.length - 1].stroke.points.length - 1
-                ].t,
+              m.stroke.points[0].t - lastInCluster.stroke.points[lastInCluster.stroke.points.length - 1].t,
             ) <= 2200;
-          if ((overlapX || gapX <= Math.max(10, avgHeight * 0.22)) && timeNear) {
+          const neuralSame =
+            gapX <= avgHeight * 0.75 &&
+            sameSymbolPairs.has(`${lastInCluster.stroke.id}:${m.stroke.id}`);
+          if (neuralSame || ((overlapX || gapX <= Math.max(10, avgHeight * 0.22)) && timeNear)) {
             cluster.push(m);
             joined = true;
             break;
@@ -777,7 +984,6 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
       }
 
       const lineTokens = clusters.map(c => classifyCluster(c, avgHeight));
-      // 二维关系修饰：\bar{x} 上划线（均值）、上标 ^T / ^{-1}、下标 _i / _{ij}
       const annotatedStrings: string[] = [];
       for (let i = 0; i < lineTokens.length; i++) {
         const cur = lineTokens[i];
@@ -791,6 +997,7 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
             annotatedStrings[annotatedStrings.length - 1] = `\\bar{${prev.token}}`;
             continue;
           }
+          hasSupSub = true;
           annotatedStrings.push(`^${cur.token}`);
           continue;
         }
@@ -799,6 +1006,7 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
           cur.bbox.h < prev.bbox.h * 0.68 &&
           cur.bbox.y > prev.bbox.y + prev.bbox.h * 0.55
         ) {
+          hasSupSub = true;
           annotatedStrings.push(`_${cur.token}`);
           continue;
         }
@@ -825,7 +1033,6 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
       [...allTokens].reverse().find(t => t.strokeIds.includes(latestStrokeId)) ??
       allTokens[allTokens.length - 1];
 
-    // 推断主学科上下文
     let detectedDomain: MathDomainHint = 'general';
     if (allTokens.some(t => t.domain === 'linear_algebra') || hasMatrixLayout) {
       detectedDomain = 'linear_algebra';
@@ -865,149 +1072,237 @@ export class EdgeInkSyntaxEncoder implements IInkSyntaxEncoderAdapter {
       hasMatrixLayout,
       boundaryFactor,
       activeLineStrokes,
+      graphEdgeHits: {
+        hasAboveBelow,
+        hasSupSub,
+        wideFracCount: wideFracBars.length,
+      },
     };
   }
 
-  private alignTokensWithSolution(
+  /**
+   * 图二/图四核心：连续可微解题图谱 Logit 头评测（彻底替换固定 4 条易错硬编码分支）。
+   * 联合融合 CTC 边缘后验 P_ctc(v) 与二维几何观测后验 P_geo(v)，对每道题动态生成的
+   * `stepLogits` 与 `pitfallLogits` 执行概率内积，输出：
+   * `alignmentScore`、`matchedStepIndex`、`hitPitfall`、`pitfallProb`、`anchorGap` 与 `stepProgress`。
+   */
+  private evaluateGraphLogitHeads(
     latex: string,
-    tokens: StrokeSymbolToken[],
-    lineCount: number,
-    hasMatrixLayout: boolean,
+    parsed: {
+      tokens: StrokeSymbolToken[];
+      lineCount: number;
+      hasMatrixLayout: boolean;
+      graphEdgeHits: { hasAboveBelow: boolean; hasSupSub: boolean; wideFracCount: number };
+    },
+    neuralPosteriors: Float32Array | undefined,
     solution: SolutionCacheEntry | null,
   ): {
     alignmentScore: number;
     matchedStepIndex: number;
     hitPitfall: SolutionPitfallSpec | null;
+    pitfallProb: number;
+    anchorGap: number;
+    stepProgress: number;
+    obsPosteriors: Float32Array;
   } {
-    if (!solution || tokens.length === 0) {
-      return { alignmentScore: 0, matchedStepIndex: -1, hitPitfall: null };
-    }
-
-    const eqCount = Math.max(
-      tokens.filter(t => t.token === '=' || t.token === '\\equiv').length,
-      (latex.match(/=/g) ?? []).length,
-    );
-    const fracCount = Math.max(
-      tokens.filter(t => t.token === '\\frac').length,
-      latex.includes('\\frac') || latex.includes('/') ? 1 : 0,
-    );
-    const hasIntegral =
-      tokens.some(t => t.token === '\\int' || t.token === '\\oint') ||
-      latex.includes('\\int') ||
-      latex.includes('\\oint');
-    const hasSum = tokens.some(t => t.token === '\\sum') || latex.includes('\\sum');
-    const hasLimitArrow =
-      tokens.some(t => t.token === '\\to') || latex.includes('\\to') || latex.includes('\\lim');
-    const hasProbSymbol =
-      tokens.some(t => t.domain === 'probability') ||
-      /P\(|Phi|\\cap|\\cup|\\sim/.test(latex);
-    const hasZero = tokens.some(t => t.token === '0') || /(^|[^0-9])0([^0-9]|$)/.test(latex);
-    const hasOps =
-      tokens.some(
-        t =>
-          t.role === 'logical_connector' ||
-          t.role === 'equation_rel' ||
-          t.role === 'calculus_operator' ||
-          t.role === 'matrix_delimiter',
-      ) || eqCount > 0 || fracCount > 0 || hasIntegral || hasSum || hasLimitArrow;
-
-    // 1. 扫描高数/线代/概率论共性易错歧路特征
-    let hitPitfall: SolutionPitfallSpec | null = null;
-    for (const pitfall of solution.commonPitfalls) {
-      const pLower = pitfall.triggerPattern.toLowerCase();
-      // 线性代数：讨论含参矩阵解的结构前，如果未求 |A|=0（缺少矩阵/行列式界定符或 '= 0' 检测）便写入多行推导
-      if (
-        (pLower.includes('|a|=0') || pLower.includes('行列式') || pLower.includes('漏讨论零点')) &&
-        lineCount >= 2 &&
-        eqCount >= 1 &&
-        !hasZero &&
-        !hasMatrixLayout
-      ) {
-        hitPitfall = pitfall;
-        break;
-      }
-      // 高数求极限/泰勒：写了分式或等号多行展开但无高阶项/未写分母展开
-      if (
-        (pLower.includes('阶数不够') || pLower.includes('截断') || pLower.includes('洛必达')) &&
-        lineCount >= 3 &&
-        fracCount >= 2
-      ) {
-        hitPitfall = pitfall;
-        break;
-      }
-      // 概率论贝叶斯公式：全概率分母求和或分式表达缺失
-      if (
-        (pLower.includes('全概率') || pLower.includes('分母') || pLower.includes('先验权重')) &&
-        lineCount >= 2 &&
-        eqCount >= 1 &&
-        fracCount === 0 &&
-        !hasSum
-      ) {
-        hitPitfall = pitfall;
-        break;
-      }
-      // 经典定积分/分部积分或常数遗漏检查
-      if (
-        (pLower.includes('除以2') || pLower.includes('分式')) &&
-        lineCount >= 2 &&
-        eqCount >= 1 &&
-        fracCount === 0
-      ) {
-        hitPitfall = pitfall;
-        break;
+    const obs = new Float32Array(MATH_VOCAB_SIZE);
+    if (neuralPosteriors) {
+      const nCopy = Math.min(obs.length, neuralPosteriors.length);
+      for (let i = 0; i < nCopy; i++) {
+        obs[i] = clamp(neuralPosteriors[i], 0, 1);
       }
     }
 
-    if (hitPitfall) {
+    const boostTok = (tok: string, val: number) => {
+      const tid = MATH_VOCAB_INDEX.get(tok);
+      if (tid !== undefined && tid > 0 && val > obs[tid]) {
+        obs[tid] = clamp(val, 0, 1);
+      }
+    };
+
+    for (const t of parsed.tokens) {
+      boostTok(t.token, t.confidence);
+      if (t.token === '/') boostTok('\\frac', t.confidence * 0.75);
+      if (t.token === '\\matrix') boostTok('|', t.confidence * 0.85);
+    }
+
+    // 融合识别得到的 LaTeX 符号串中的显式线索
+    const latexCmds = latex.match(/\\[a-zA-Z]+|[0-9a-zA-Z=+\-*/^_|(){}\[\],.<>!]/g) ?? [];
+    for (const tok of latexCmds) {
+      boostTok(tok, 0.82);
+    }
+    if (parsed.graphEdgeHits.wideFracCount > 0 || parsed.graphEdgeHits.hasAboveBelow) {
+      boostTok('\\frac', 0.82);
+    }
+    if (parsed.graphEdgeHits.hasSupSub) {
+      boostTok('^', 0.72);
+      boostTok('_', 0.72);
+    }
+
+    const roleAct: Record<GraphGeometricRole, number> = {
+      logical_connector: 0,
+      fraction_bar: 0,
+      equation_rel: 0,
+      calculus_operator: 0,
+      matrix_delimiter: 0,
+      probability_rel: 0,
+      operand: 0,
+    };
+    for (const t of parsed.tokens) {
+      if (t.role !== 'scratch_draft') {
+        roleAct[t.role] = Math.max(roleAct[t.role], t.confidence);
+      }
+    }
+    if (parsed.hasMatrixLayout) roleAct.matrix_delimiter = Math.max(roleAct.matrix_delimiter, 0.9);
+    if (parsed.graphEdgeHits.wideFracCount > 0 || (obs[MATH_VOCAB_INDEX.get('\\frac') ?? -1] ?? 0) >= 0.55) {
+      roleAct.fraction_bar = Math.max(roleAct.fraction_bar, 0.85);
+    }
+    if ((obs[MATH_VOCAB_INDEX.get('=') ?? -1] ?? 0) >= 0.5 || latex.includes('=')) {
+      roleAct.equation_rel = Math.max(roleAct.equation_rel, 0.85);
+    }
+    if (
+      (obs[MATH_VOCAB_INDEX.get('\\int') ?? -1] ?? 0) >= 0.5 ||
+      (obs[MATH_VOCAB_INDEX.get('\\lim') ?? -1] ?? 0) >= 0.5
+    ) {
+      roleAct.calculus_operator = Math.max(roleAct.calculus_operator, 0.85);
+    }
+
+    const hasAnyOps =
+      roleAct.equation_rel >= 0.45 ||
+      roleAct.fraction_bar >= 0.45 ||
+      roleAct.calculus_operator >= 0.45 ||
+      roleAct.matrix_delimiter >= 0.45 ||
+      roleAct.logical_connector >= 0.45;
+
+    if (!solution || parsed.tokens.length === 0) {
       return {
-        alignmentScore: -0.65,
-        matchedStepIndex: Math.min(Math.max(0, lineCount - 1), Math.max(0, solution.steps.length - 1)),
-        hitPitfall,
-      };
-    }
-
-    // 2. 步骤主干匹配
-    if (solution.steps.length === 0) {
-      return {
-        alignmentScore: hasOps ? 0.28 : 0,
-        matchedStepIndex: 0,
+        alignmentScore: hasAnyOps ? 0.28 : 0,
+        matchedStepIndex: -1,
         hitPitfall: null,
+        pitfallProb: 0,
+        anchorGap: 0,
+        stepProgress: 0,
+        obsPosteriors: obs,
       };
     }
 
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < solution.steps.length; i++) {
-      const step = solution.steps[i];
-      const expected = step.expectedTokens.join(' ') + ' ' + step.goalDescription;
-      let matchWeight = 0;
-      if (expected.includes('=') && eqCount > 0) matchWeight += 0.25;
-      if ((expected.includes('/') || expected.includes('frac')) && fracCount > 0) matchWeight += 0.3;
-      if ((expected.includes('int') || expected.includes('积分')) && hasIntegral) matchWeight += 0.35;
-      if ((expected.includes('sum') || expected.includes('求和')) && hasSum) matchWeight += 0.3;
-      if ((expected.includes('to') || expected.includes('lim')) && hasLimitArrow) matchWeight += 0.3;
-      if ((expected.includes('matrix') || expected.includes('det') || expected.includes('|A|')) && hasMatrixLayout) {
-        matchWeight += 0.35;
-      }
-      if ((expected.includes('P(') || expected.includes('Phi') || expected.includes('~')) && hasProbSymbol) {
-        matchWeight += 0.3;
-      }
-      if (expected.includes('0') && hasZero) matchWeight += 0.15;
-      if (latex.includes('expr') || latex.includes('sym')) matchWeight += 0.12;
+    // 1. 评测动态生成的每题 PitfallLogitHeadSpec（连续概率逻辑回归，支持题谱泛化）
+    let maxPitfallProb = 0;
+    let hitPitfall: SolutionPitfallSpec | null = null;
+    let bestPitfallProbTriggered = 0;
 
-      const lineProgressDiff = Math.abs(Math.min(lineCount - 1, solution.steps.length - 1) - i);
-      const structuralFit = matchWeight - lineProgressDiff * 0.12;
-      if (structuralFit > bestScore) {
-        bestScore = structuralFit;
-        bestIdx = i;
+    for (const pitfall of solution.commonPitfalls) {
+      const head = pitfall.pitfallLogits;
+      if (!head) continue;
+      let z = head.bias + head.lineCountWeight * parsed.lineCount;
+      for (const [tok, w] of Object.entries(head.presentWeights)) {
+        const tid = MATH_VOCAB_INDEX.get(tok);
+        const pSeen = tid !== undefined && tid > 0 ? obs[tid] : 0;
+        z += w * pSeen;
+      }
+      for (const [tok, w] of Object.entries(head.missingWeights)) {
+        const tid = MATH_VOCAB_INDEX.get(tok);
+        const pSeen = tid !== undefined && tid > 0 ? obs[tid] : 0;
+        z += w * (1 - pSeen);
+      }
+      for (const [role, w] of Object.entries(head.roleWeights)) {
+        const rAct = roleAct[role as GraphGeometricRole] ?? 0;
+        z += (w ?? 0) * rAct;
+      }
+      const prob = sigmoid(z);
+      if (prob > maxPitfallProb) {
+        maxPitfallProb = prob;
+      }
+      if (
+        parsed.lineCount >= head.minLineCount &&
+        prob >= head.threshold &&
+        prob > bestPitfallProbTriggered
+      ) {
+        bestPitfallProbTriggered = prob;
+        hitPitfall = pitfall;
       }
     }
 
-    const positiveA = clamp(0.16 + bestScore * 0.72 + (hasOps ? 0.15 : 0), -0.2, 0.9);
+    // 2. 评测动态生成的 StepLogitHeadSpec（计算每步覆盖率、anchorGap 与 stepProgress）
+    if (solution.steps.length === 0) {
+      const fallbackAlign = hitPitfall
+        ? -clamp(0.45 + 0.35 * maxPitfallProb, 0.55, 0.85)
+        : clamp((hasAnyOps ? 0.28 : 0.05) - 0.35 * Math.max(0, maxPitfallProb - 0.35), -0.8, 0.9);
+      return {
+        alignmentScore: Number(fallbackAlign.toFixed(2)),
+        matchedStepIndex: 0,
+        hitPitfall,
+        pitfallProb: Number(maxPitfallProb.toFixed(3)),
+        anchorGap: 0,
+        stepProgress: parsed.lineCount > 0 ? 0.5 : 0,
+        obsPosteriors: obs,
+      };
+    }
+
+    const totalSteps = solution.steps.length;
+    const empProgress = clamp(parsed.lineCount / Math.max(1, totalSteps), 0, 1);
+    let bestStepIdx = 0;
+    let bestStepFit = -Infinity;
+    let bestStepCoverage = 0;
+    let bestAnchorGap = 0;
+
+    for (let i = 0; i < totalSteps; i++) {
+      const step = solution.steps[i];
+      const head = step.stepLogits;
+      let weightedHit = 0;
+      let totalWeight = 0;
+      let missingMass = 0;
+
+      if (head) {
+        for (const [tok, wRaw] of Object.entries(head.tokenWeights)) {
+          const w = Math.max(0, wRaw);
+          if (w <= 0) continue;
+          const tid = MATH_VOCAB_INDEX.get(tok);
+          const pSeen = tid !== undefined && tid > 0 ? obs[tid] : 0;
+          weightedHit += w * pSeen;
+          missingMass += w * (1 - pSeen);
+          totalWeight += w;
+        }
+        for (const [role, wRaw] of Object.entries(head.roleWeights)) {
+          const w = Math.max(0, wRaw ?? 0);
+          if (w <= 0) continue;
+          const rAct = roleAct[role as GraphGeometricRole] ?? 0;
+          weightedHit += w * rAct;
+          missingMass += w * (1 - rAct);
+          totalWeight += w;
+        }
+      }
+
+      const denom = Math.max(0.25, totalWeight);
+      const coverage = clamp(weightedHit / denom, 0, 1);
+      const gap = clamp(missingMass / denom, 0, 1);
+      const progressCenter = head?.progressCenter ?? (totalSteps > 1 ? i / (totalSteps - 1) : 0.5);
+      const fitScore = coverage * 1.15 - Math.abs(empProgress - progressCenter) * 0.25;
+
+      if (fitScore > bestStepFit) {
+        bestStepFit = fitScore;
+        bestStepIdx = i;
+        bestStepCoverage = coverage;
+        bestAnchorGap = gap;
+      }
+    }
+
+    const stepProgress = clamp((bestStepIdx + bestStepCoverage) / Math.max(1, totalSteps), 0, 1);
+    const pitfallPenalty = hitPitfall
+      ? clamp(0.45 + 0.35 * maxPitfallProb, 0.55, 0.85)
+      : Math.max(0, maxPitfallProb - 0.38) * 0.65;
+    const rawAlign = hitPitfall
+      ? -pitfallPenalty
+      : 0.14 + bestStepFit * 0.68 + (hasAnyOps ? 0.12 : 0) - pitfallPenalty;
+
     return {
-      alignmentScore: Number(positiveA.toFixed(2)),
-      matchedStepIndex: bestIdx,
-      hitPitfall: null,
+      alignmentScore: Number(clamp(rawAlign, -0.85, 0.92).toFixed(2)),
+      matchedStepIndex: bestStepIdx,
+      hitPitfall,
+      pitfallProb: Number(maxPitfallProb.toFixed(3)),
+      anchorGap: Number(bestAnchorGap.toFixed(3)),
+      stepProgress: Number(stepProgress.toFixed(3)),
+      obsPosteriors: obs,
     };
   }
 }

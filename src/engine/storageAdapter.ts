@@ -1,4 +1,5 @@
 import * as FileSystem from 'expo-file-system/legacy';
+import type { LearnerCognitiveTwin } from '../agent';
 import type { MotorFingerprint } from './cognitiveState';
 import type { PolicySnapshot } from './personalizedPolicy';
 import { loadPersistedProfile, savePersistedProfile } from './profileStore';
@@ -7,6 +8,7 @@ import type { EngineSessionPayload, IStorageAdapter } from './types';
 
 const CACHE_FILENAME = 'inkpulse-solution-cache.json';
 const LAST_SESSION_FILENAME = 'inkpulse-last-session-summary.json';
+const LEARNER_TWIN_FILENAME = 'inkpulse-learner-twin.json';
 
 function docUri(filename: string): string | null {
   const dir = FileSystem.documentDirectory;
@@ -78,5 +80,27 @@ export class LocalStorageAdapter implements IStorageAdapter {
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .slice(0, 40);
     await atomicWriteJson(uri, recent);
+  }
+
+  public async loadLearnerTwin(): Promise<LearnerCognitiveTwin | null> {
+    const uri = docUri(LEARNER_TWIN_FILENAME);
+    if (!uri) return null;
+    try {
+      const info = await FileSystem.getInfoAsync(uri);
+      if (!info.exists) return null;
+      const raw = await FileSystem.readAsStringAsync(uri);
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' && parsed.schemaVersion === 'twin-v1'
+        ? (parsed as LearnerCognitiveTwin)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  public async saveLearnerTwin(twin: LearnerCognitiveTwin): Promise<void> {
+    const uri = docUri(LEARNER_TWIN_FILENAME);
+    if (!uri) return;
+    await atomicWriteJson(uri, twin);
   }
 }

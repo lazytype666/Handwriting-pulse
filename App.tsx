@@ -205,6 +205,7 @@ function Workspace() {
     setSaving(true);
     try {
       const { strokes, stallEvents } = await canvas.current.snapshot();
+      await engineRef.current.finalizeCurrentSession();
       const summary = engineRef.current.getSummary();
       const receipt = await saveSnapshot(strokes, stallEvents, {
         problemId: summary.problemId,
@@ -216,6 +217,8 @@ function Workspace() {
         companionMode: summary.companionMode,
         policy: summary.policySnapshot,
         feedbackLogs: summary.feedbackLogs,
+        learningTelemetry: summary.currentTelemetry,
+        learnerTwin: summary.learnerTwin,
       });
       void engineRef.current.persistAllState();
       setResult({ kind: 'saved', receipt });
@@ -360,7 +363,12 @@ function Workspace() {
           engine={engineRef.current}
           onClose={() => setView(null)}
           onSave={(value) => {
-            if (value !== question) dismiss();
+            if (value !== question) {
+              dismiss();
+              if (question.trim()) {
+                void engineRef.current.finalizeCurrentSession();
+              }
+            }
             setQuestion(value);
             setView(null);
             if (!value) {

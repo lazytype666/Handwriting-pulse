@@ -8,20 +8,52 @@ import {
 import type { StallType } from '../stalls';
 import { latexToReadableMath } from '../utils/mathFormat';
 import {
+  compileDefaultPitfallLogits,
+  compileDefaultStepLogits,
+  sanitizePitfallLogits,
+  sanitizeStepLogits,
+  type GraphGeometricRole,
+  type PitfallLogitHeadSpec,
+  type StepLogitHeadSpec,
+} from './graphLogits';
+import {
   HINT_STYLES,
   HINT_STYLE_LABELS,
   type HintStyle,
 } from './personalizedPolicy';
 
+export type { GraphGeometricRole, PitfallLogitHeadSpec, StepLogitHeadSpec };
+
 export interface SolutionStepSpec {
   stepIndex: number;
   goalDescription: string;
   expectedTokens: string[];
+  stepLogits?: StepLogitHeadSpec;
 }
 
 export interface SolutionPitfallSpec {
   triggerPattern: string;
   warningHint: string;
+  pitfallLogits?: PitfallLogitHeadSpec;
+}
+
+export function ensureEntryGraphLogits(entry: SolutionCacheEntry): SolutionCacheEntry {
+  const totalSteps = Math.max(1, entry.steps.length);
+  const steps = entry.steps.map((s, idx) => ({
+    ...s,
+    stepLogits: sanitizeStepLogits(
+      s.stepLogits,
+      s.expectedTokens ?? [],
+      typeof s.stepIndex === 'number' ? s.stepIndex : idx,
+      totalSteps,
+      s.goalDescription,
+    ),
+  }));
+  const commonPitfalls = entry.commonPitfalls.map(p => ({
+    ...p,
+    pitfallLogits: sanitizePitfallLogits(p.pitfallLogits, p.triggerPattern, p.warningHint),
+  }));
+  return { ...entry, steps, commonPitfalls };
 }
 
 export interface StyleHintTiers {
@@ -588,6 +620,7 @@ export function distillSolutionGraphFromMathCoT(
   const commonPitfalls: SolutionPitfallSpec[] = domainMatches.slice(0, 2).map(m => ({
     triggerPattern: m.triggerPattern,
     warningHint: m.warningHint,
+    pitfallLogits: compileDefaultPitfallLogits(m.triggerPattern, m.warningHint),
   }));
 
   const hintsByStyle = buildCompleteHintsFromGraph(
@@ -598,7 +631,7 @@ export function distillSolutionGraphFromMathCoT(
     sealedFinalAnswer,
   );
 
-  return {
+  return ensureEntryGraphLogits({
     problemKey: normalizeProblemKey(problemText),
     problemText: problemText.trim(),
     steps,
@@ -607,7 +640,7 @@ export function distillSolutionGraphFromMathCoT(
     ...(sealedFinalAnswer ? { sealedFinalAnswer } : {}),
     sourceMode,
     updatedAt: Date.now(),
-  };
+  });
 }
 
 /**
@@ -635,7 +668,7 @@ export class SolutionCacheManager {
     const key = normalizeProblemKey(entry.problemText || entry.problemKey);
     if (!key) return;
     if (!this.entries.has(key)) {
-      this.entries.set(key, { ...entry, problemKey: key });
+      this.entries.set(key, ensureEntryGraphLogits({ ...entry, problemKey: key }));
     }
   }
 
@@ -748,8 +781,14 @@ export class SolutionCacheManager {
           .join('、');
         const cloudPrompt = [
           `题干：${problemText.trim()}`,
-          `请为该题生成结构化解题图谱 JSON（仅返回纯 JSON，确保 LaTeX 反斜杠用双反斜杠或简明文本）：包含 steps 数组(stepIndex, goalDescription, expectedTokens)、commonPitfalls 数组(triggerPattern, warningHint)、sealedFinalAnswer（仅写最终数值/式子）以及 ${coreStyleList} 的 l1/l2/l3 提示。`,
-          '规则：steps[].goalDescription 与 l1/l2/l3 严禁出现最终答案或完整结果，只提示步骤方向与易错细节。',
+          [
+            `请为该题生成结构化解题图谱与端侧实时检验 Logits JSON（仅返回纯 JSON，LaTeX 命令用双反斜杠，例如 \\\\frac, \\\\int, \\\\lim）：`,
+            `1) steps 数组：每项包含 stepIndex, goalDescription, expectedTokens(核心符号数组), stepLogits:{ bias(-1.2~0), progressCenter(0~1), tokenWeights(键必须选 125 词表如 "=","0","\\\\frac","\\\\int","\\\\sum","\\\\lim","\\\\to","\\\\det","|","x","r","\\\\lambda","^","_" 等，权重0.5~2.0), roleWeights(键限 logical_connector|fraction_bar|equation_rel|calculus_operator|matrix_delimiter|probability_rel|operand，权重0.5~2.0) }`,
+            `2) commonPitfalls 数组（针对本题的 1~3 条典型歧路）：每项包含 triggerPattern, warningHint(15~40字温和自查提醒), pitfallLogits:{ bias(-2.5~-0.5), threshold(0.55~0.8), minLineCount(1~4), lineCountWeight(0.2~0.8), presentWeights(写出的危险特征权重), missingWeights(漏写的关键校验权重如 "0","r","\\\\frac","\\\\sum"), roleWeights(结构角色权重，负值表示有该结构即免警报) }`,
+            `3) sealedFinalAnswer（仅写最终数值/表达式，供系统加密封存）`,
+            `4) hintsByStyle：包含 ${coreStyleList} 各自的 l1/l2/l3 分级启发。`,
+          ].join('\n'),
+          '规则：steps[].goalDescription、commonPitfalls[].warningHint 与 hintsByStyle 严禁泄露最终答案。',
         ].join('\n\n');
 
         const edgeTokenBudget = /deepseek|r1|reasoner/i.test(model) ? 3072 : 1600;
@@ -757,7 +796,7 @@ export class SolutionCacheManager {
           model,
           stream: false,
           temperature: 0.15,
-          max_tokens: useEdge ? edgeTokenBudget : 1200,
+          max_tokens: useEdge ? edgeTokenBudget : 1800,
           ...(useEdge ? { repeat_penalty: 1.15 } : {}),
           messages: [
             { role: 'system', content: PREWARM_SYSTEM_MESSAGE },
@@ -809,13 +848,18 @@ export class SolutionCacheManager {
           const rawSteps = Array.isArray(parsed.steps) ? parsed.steps : [];
           let cleanSteps: SolutionStepSpec[] = rawSteps
             .filter(s => s && cleanModelText(s.goalDescription, 5).length >= 5)
-            .map((s, idx) => ({
-              stepIndex: typeof s.stepIndex === 'number' ? s.stepIndex : idx,
-              goalDescription: stripSpoilerFromGoal(cleanModelText(s.goalDescription, 5), sealed),
-              expectedTokens: Array.isArray(s.expectedTokens)
-                ? s.expectedTokens.map(String).filter(t => !ECHO_PLACEHOLDER_RE.test(t)).slice(0, 6)
-                : extractMathTokensFromText(s.goalDescription),
-            }))
+            .map((s, idx) => {
+              const goalDescription = stripSpoilerFromGoal(cleanModelText(s.goalDescription, 5), sealed);
+              const expectedTokens = Array.isArray(s.expectedTokens)
+                ? s.expectedTokens.map(String).filter(t => !ECHO_PLACEHOLDER_RE.test(t)).slice(0, 8)
+                : extractMathTokensFromText(s.goalDescription);
+              return {
+                stepIndex: typeof s.stepIndex === 'number' ? s.stepIndex : idx,
+                goalDescription,
+                expectedTokens,
+                stepLogits: (s as SolutionStepSpec).stepLogits,
+              };
+            })
             .filter(s => s.goalDescription.length >= 5 && !ECHO_PLACEHOLDER_RE.test(s.goalDescription));
 
           if (cleanSteps.length === 0) {
@@ -827,21 +871,42 @@ export class SolutionCacheManager {
               },
             ];
           }
+          const totalCleanSteps = Math.max(1, cleanSteps.length);
+          cleanSteps = cleanSteps.map((s, idx) => ({
+            ...s,
+            stepLogits: sanitizeStepLogits(
+              s.stepLogits,
+              s.expectedTokens,
+              s.stepIndex ?? idx,
+              totalCleanSteps,
+              s.goalDescription,
+            ),
+          }));
 
           const rawPitfalls = Array.isArray(parsed.commonPitfalls) ? parsed.commonPitfalls : [];
           let cleanPitfalls: SolutionPitfallSpec[] = rawPitfalls
-            .map(p => ({
-              triggerPattern: cleanModelText(p?.triggerPattern, 4),
-              warningHint:
+            .map(p => {
+              const triggerPattern = cleanModelText(p?.triggerPattern, 4);
+              const warningHint =
                 filterSafeHintText(cleanModelText(p?.warningHint, 8), sealed) ??
                 domainFallback[0]?.warningHint ??
-                '',
-            }))
+                '';
+              return {
+                triggerPattern,
+                warningHint,
+                pitfallLogits: sanitizePitfallLogits(
+                  (p as SolutionPitfallSpec | undefined)?.pitfallLogits,
+                  triggerPattern,
+                  warningHint,
+                ),
+              };
+            })
             .filter(p => p.triggerPattern.length > 0 && p.warningHint.length >= 8);
           if (cleanPitfalls.length === 0) {
             cleanPitfalls = domainFallback.map(d => ({
               triggerPattern: d.triggerPattern,
               warningHint: d.warningHint,
+              pitfallLogits: compileDefaultPitfallLogits(d.triggerPattern, d.warningHint),
             }));
           }
 

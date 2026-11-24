@@ -2,6 +2,17 @@ import type { Diagnostics, Stroke } from '../capture';
 import type { HintLevel } from '../hints/safety';
 import type { StallEvent, StallType, Thresholds } from '../stalls';
 import {
+  extractKnowledgeTags,
+  KNOWLEDGE_TAG_LABELS,
+  LearningCoachAgentClient,
+  ProcessKnowledgeTracer,
+  SessionTelemetryAggregator,
+  type KnowledgeConceptTag,
+  type LearnerCognitiveTwin,
+  type LearningCoachAdvice,
+  type SessionLearningTelemetry,
+} from '../agent';
+import {
   ANNOTATION_LABEL_ZH,
   AnnotationTracker,
   type AnnotationLabel,
@@ -17,6 +28,7 @@ import {
 } from './cognitiveState';
 import { EdgeHintModelAdapter } from './edgeHintModel';
 import {
+  canonicalizeLineStrokesForNeural,
   EdgeInkSyntaxEncoder,
   extractSpatialStream,
   getSharedNeuralRunner,
@@ -30,6 +42,10 @@ import {
   type NeuralCognitiveOutput,
   type NeuralMathOutput,
 } from './neuralRuntime';
+import {
+  OnnxEdgeSyntaxAdapter,
+  registerOnnxNativeRuntime,
+} from './onnxSyntaxAdapter';
 import {
   HINT_STYLES,
   HINT_STYLE_LABELS,
@@ -54,7 +70,10 @@ import { SAMPLE_PROBLEMS, type SampleProblemSpec } from './sampleProblems';
 import {
   getOfflineStyledHint,
   SolutionCacheManager,
+  type GraphGeometricRole,
+  type PitfallLogitHeadSpec,
   type SolutionCacheEntry,
+  type StepLogitHeadSpec,
 } from './solutionCache';
 import { LocalStorageAdapter } from './storageAdapter';
 import type {
@@ -79,22 +98,30 @@ export interface ProblemCacheOverview {
 export {
   ANNOTATION_LABEL_ZH,
   AnnotationTracker,
+  canonicalizeLineStrokesForNeural,
   COGNITIVE_CATEGORIES,
   COGNITIVE_CATEGORY_ZH,
   COMPANION_MODE_LABELS,
   EdgeHintModelAdapter,
   EdgeInkSyntaxEncoder,
   EdgeNeuralModelRunner,
+  extractKnowledgeTags,
   extractSpatialStream,
   getSharedNeuralRunner,
   HINT_STYLES,
   HINT_STYLE_LABELS,
+  KNOWLEDGE_TAG_LABELS,
+  LearningCoachAgentClient,
   loadPersistedProfile,
   LocalStorageAdapter,
+  OnnxEdgeSyntaxAdapter,
   parseLatexBlocks,
   ProblemIngestorAdapter,
+  ProcessKnowledgeTracer,
+  registerOnnxNativeRuntime,
   SAMPLE_PROBLEMS,
   savePersistedProfile,
+  SessionTelemetryAggregator,
   type AnnotationLabel,
   type AnnotationRecord,
   type CognitiveCategory,
@@ -103,17 +130,24 @@ export {
   type EncodedExpressionResult,
   type FeedbackLogEntry,
   type FeedbackSignal,
+  type GraphGeometricRole,
   type HintStyle,
   type IngestedProblemResult,
+  type KnowledgeConceptTag,
+  type LearnerCognitiveTwin,
+  type LearningCoachAdvice,
   type MotorFingerprint,
   type NeuralCognitiveOutput,
   type NeuralMathOutput,
   type PersistedUserProfile,
+  type PitfallLogitHeadSpec,
   type PolicySnapshot,
   type ProblemContentBlock,
   type SampleProblemSpec,
+  type SessionLearningTelemetry,
   type SolutionCacheEntry,
   type StateTraceSample,
+  type StepLogitHeadSpec,
 };
 
 export type {
@@ -142,23 +176,22 @@ const QUICK_DISMISS_MS = 1500;
 const THINKING_HOLD_SUPPRESS_MS = 8500;
 
 const NEURAL_WINDOW_STEPS = 20;
-const NEURAL_DYNAMICS_DIM = 10;
 
 interface StrokeStepFeature {
   strokeId: number;
   endT: number;
-  dyn10: Float32Array;
-  sem64: Float32Array;
+  dynVec: Float32Array;
+  semVec: Float32Array;
 }
 
 /**
- * 《笔迹脉搏》端侧认知引擎核心调度器（完整四层双流神经状态机架构协调中枢）。
+ * 《笔迹脉搏》端侧认知引擎与个性化学习智能体核心调度器。
  *
  * 【自研实现】整合：
- * 1. 双流神经网络：EdgeMathEncoder 量化端侧公式识别 + CognitiveStateNet 严格因果 6 分类认知状态推断；
- * 2. 多源观测：笔迹流语法编码器 (EdgeInkSyntaxEncoder) + 解题图谱缓存 (SolutionCacheManager) + 题目摄入器 (ProblemIngestor)；
- * 3. 内环个性化：个人运动指纹在线分布自适应 (MotorFingerprint EMA)；
- * 4. 外环个性化：7 维 LinUCB 六风格提示路由 + L0-L3 渐进提示 + 5 秒恢复书写隐式闭环 + 伴随式零负担微标注。
+ * 1. 双流神经模型 + 笔画关系图：10 通道 `EdgeMathGraphNet`（含 Quote ①②③④）与 14 维因果图谱融合 `CognitiveStateNet`；
+ * 2. 图谱动态验证 + 状态机闭环：基于商用大模型 per-problem `stepLogits`/`pitfallLogits` 计算连续锚点缺口、步骤滞后与歧路概率并注入状态机；
+ * 3. 内/外环自适应：个人运动指纹 (MotorFingerprint EMA) + 7 维 LinUCB 六风格提示路由；
+ * 4. 个性化学习智能体：过程性 BKT 知识追踪 (`ProcessKnowledgeTracer`)、书写习惯数字孪生与双轨教练客户端。
  */
 export class HandwritingPulseEngine implements IHandwritingPulseEngine {
   private readonly cognition = new CognitiveStateEngine();
@@ -170,6 +203,9 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
   private readonly builtInEdgeAdapter = new EdgeHintModelAdapter();
   private readonly annotationTracker = new AnnotationTracker();
   private readonly storage = new LocalStorageAdapter();
+  private readonly telemetryAggregator = new SessionTelemetryAggregator();
+  private readonly knowledgeTracer = new ProcessKnowledgeTracer();
+  private readonly coachClient = new LearningCoachAgentClient();
 
   private customEdgeAdapter: IEdgeHintModelAdapter | null = null;
   private problemId = '';
@@ -187,11 +223,12 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
   private lastSpeedRatio = 1;
   private pendingObs: PendingObservation | null = null;
   private latestSelection: { style: HintStyle; context: number[] } | null = null;
+  private lastStepAdvanceT = 0;
+  private prevMatchedStepForFeature = -1;
 
   constructor() {
     this.syntaxEncoder.setNeuralRunner(this.neuralRunner);
 
-    // 预装离线典型例题解题图谱，保证断网状态也可直接体验步骤对齐与歧路预警
     for (const sample of SAMPLE_PROBLEMS) {
       this.solutionCache.preloadEntry(sample.cacheEntry);
     }
@@ -210,6 +247,11 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
   } | null> {
     const cachedList = await this.storage.loadSolutionCache();
     this.solutionCache.hydrateEntries(cachedList);
+
+    const savedTwin = await this.storage.loadLearnerTwin();
+    if (savedTwin) {
+      this.knowledgeTracer.hydrateTwin(savedTwin);
+    }
 
     const profile = await this.storage.loadUserProfile('default');
     if (profile) {
@@ -241,6 +283,7 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
   public async persistAllState(): Promise<void> {
     await this.storage.saveUserProfile('default', this.exportPersistedProfile());
     await this.storage.saveSolutionCache(this.solutionCache.exportAllEntries());
+    await this.storage.saveLearnerTwin(this.knowledgeTracer.getTwin());
   }
 
   public resetPersonalization(): void {
@@ -257,8 +300,11 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
     this.stepHistory = [];
     this.lastPitfallTaggedKey = '';
     this.thinkingHoldUntil = 0;
+    this.lastStepAdvanceT = 0;
+    this.prevMatchedStepForFeature = -1;
     this.cognition.resetSessionState();
     this.annotationTracker.reset();
+    this.telemetryAggregator.reset();
   }
 
   public setCompanionMode(mode: CompanionMode): void {
@@ -280,6 +326,44 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
 
   public getLatestSyntaxResult(): EncodedExpressionResult | null {
     return this.latestSyntax;
+  }
+
+  public getLearnerTwin(): LearnerCognitiveTwin {
+    return this.knowledgeTracer.getTwin();
+  }
+
+  public buildSessionTelemetrySnapshot(nowMs = Date.now()): SessionLearningTelemetry {
+    const entry = this.solutionCache.getEntry(this.problemText);
+    return this.telemetryAggregator.buildTelemetry({
+      problemText: this.problemText,
+      problemKey: entry?.problemKey ?? (this.problemText.trim() || 'untitled'),
+      strokes: this.activeStrokes,
+      totalStepsExpected: entry?.steps.length ?? 1,
+      feedbackLogs: this.policy.getFeedbackLogs(),
+      latestState: this.cognition.getState(),
+      nowMs,
+    });
+  }
+
+  /**
+   * 结题/切题时归档当前题全过程遥测、更新端侧 Process-BKT 数字孪生画像、落盘并在配置了后端时静默同步。
+   */
+  public async finalizeCurrentSession(nowMs = Date.now()): Promise<{
+    telemetry: SessionLearningTelemetry;
+    twin: LearnerCognitiveTwin;
+    synced: boolean;
+  }> {
+    const telemetry = this.buildSessionTelemetrySnapshot(nowMs);
+    const twin = this.knowledgeTracer.ingestSession(telemetry);
+    await this.storage.saveLearnerTwin(twin);
+    const synced = await this.coachClient.syncSessionTelemetry(telemetry, twin);
+    return { telemetry, twin, synced };
+  }
+
+  public async requestCoachAdvice(): Promise<LearningCoachAdvice> {
+    const snapshot = this.buildSessionTelemetrySnapshot();
+    const twin = this.knowledgeTracer.getTwin();
+    return this.coachClient.requestCoachReport(twin, snapshot);
   }
 
   public getAnnotationCounts(): Record<AnnotationLabel, number> {
@@ -387,6 +471,7 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
     this.activeStrokes.push(stroke);
     if (stroke.tool === 'eraser') {
       this.annotationTracker.recordEraseOrUndo(stroke, 'eraser_event');
+      this.telemetryAggregator.recordCorrection('erase');
     }
     await this.recomputeSyntaxAlignment();
     this.rebuildStepWindowAndInferNeural(stroke.id, this.latestSyntax?.alignmentScore ?? 0);
@@ -401,14 +486,16 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
     }
     this.strokeSemCache.delete(stroke.id);
     this.annotationTracker.recordEraseOrUndo(stroke, 'undo_event');
+    this.telemetryAggregator.recordCorrection('undo');
     await this.recomputeSyntaxAlignment();
     this.rebuildStepWindowAndInferNeural(-1, this.latestSyntax?.alignmentScore ?? 0);
   }
 
   private rebuildStepWindowAndInferNeural(newestStrokeId: number, newestAlignA: number): void {
-    const prevAlignById = new Map<number, number>();
+    const dynDim = this.neuralRunner.getDynamicsDim();
+    const prevById = new Map<number, Float32Array>();
     for (const prev of this.stepHistory) {
-      prevAlignById.set(prev.strokeId, prev.dyn10[9]);
+      prevById.set(prev.strokeId, prev.dynVec);
     }
 
     const fp = this.cognition.getFingerprint();
@@ -418,6 +505,15 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
     let decayPause = 0;
     let decayErase = 0;
     const rebuilt: StrokeStepFeature[] = [];
+
+    const curAnchorGap = this.latestSyntax?.anchorGap ?? 0;
+    const curStepProgress = this.latestSyntax?.stepProgress ?? 0;
+    const curMatchedStep = this.latestSyntax?.matchedStepIndex ?? -1;
+    const stepJustAdvanced =
+      newestStrokeId >= 0 && curMatchedStep > this.prevMatchedStepForFeature && curMatchedStep >= 0;
+    if (stepJustAdvanced) {
+      this.prevMatchedStepForFeature = curMatchedStep;
+    }
 
     for (const s of this.activeStrokes) {
       const pts = s.points;
@@ -473,31 +569,63 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
       );
       prevEndT = tEnd;
 
+      const prevVec = prevById.get(s.id);
       const alignA =
         s.id === newestStrokeId
           ? newestAlignA
-          : (prevAlignById.get(s.id) ?? newestAlignA);
+          : (prevVec && prevVec.length > 9 ? prevVec[9] : newestAlignA);
 
-      const dyn10 = new Float32Array([
-        Math.min(1.5, Math.log1p(durMs) / 8.0),
-        pauseZ,
-        speedRatio,
-        speedInstab,
-        prePauseM,
-        isEraser,
-        isFrag,
-        Math.tanh(decayPause / 2.5),
-        Math.tanh(decayErase / 2.5),
-        Math.max(-1.0, Math.min(1.0, alignA)),
-      ]);
-
-      let sem64 = this.strokeSemCache.get(s.id);
-      if (!sem64) {
-        sem64 = this.syntaxEncoder.encodeSingleStrokeSemantic(s);
-        this.strokeSemCache.set(s.id, sem64);
+      if (s.id === newestStrokeId && stepJustAdvanced) {
+        this.lastStepAdvanceT = tEnd;
+      } else if (this.lastStepAdvanceT === 0) {
+        this.lastStepAdvanceT = tEnd;
       }
 
-      rebuilt.push({ strokeId: s.id, endT: tEnd, dyn10, sem64 });
+      const elapsedSinceAdv = Math.max(0, tEnd - this.lastStepAdvanceT);
+      const rawAnchorGap =
+        s.id === newestStrokeId
+          ? curAnchorGap
+          : (prevVec && prevVec.length > 10 ? prevVec[10] : curAnchorGap);
+      const rawStepStag =
+        s.id === newestStrokeId
+          ? Math.min(1.0, elapsedSinceAdv / 30000)
+          : (prevVec && prevVec.length > 11 ? prevVec[11] : Math.min(1.0, elapsedSinceAdv / 30000));
+      const rawStepPulse =
+        s.id === newestStrokeId
+          ? stepJustAdvanced
+            ? 1.0
+            : Math.exp(-elapsedSinceAdv / 4500)
+          : (prevVec && prevVec.length > 12 ? prevVec[12] : Math.exp(-elapsedSinceAdv / 4500));
+      const rawStepProg =
+        s.id === newestStrokeId
+          ? curStepProgress
+          : (prevVec && prevVec.length > 13 ? prevVec[13] : curStepProgress);
+
+      const dynVec = new Float32Array(dynDim);
+      dynVec[0] = Math.min(1.5, Math.log1p(durMs) / 8.0);
+      dynVec[1] = pauseZ;
+      dynVec[2] = speedRatio;
+      dynVec[3] = speedInstab;
+      dynVec[4] = prePauseM;
+      dynVec[5] = isEraser;
+      dynVec[6] = isFrag;
+      dynVec[7] = Math.tanh(decayPause / 2.5);
+      dynVec[8] = Math.tanh(decayErase / 2.5);
+      dynVec[9] = Math.max(-1.0, Math.min(1.0, alignA));
+      if (dynDim >= 14) {
+        dynVec[10] = Math.max(0, Math.min(1, rawAnchorGap));
+        dynVec[11] = Math.max(0, Math.min(1, rawStepStag));
+        dynVec[12] = Math.max(0, Math.min(1, rawStepPulse));
+        dynVec[13] = Math.max(0, Math.min(1, rawStepProg));
+      }
+
+      let semVec = this.strokeSemCache.get(s.id);
+      if (!semVec) {
+        semVec = this.syntaxEncoder.encodeSingleStrokeSemantic(s);
+        this.strokeSemCache.set(s.id, semVec);
+      }
+
+      rebuilt.push({ strokeId: s.id, endT: tEnd, dynVec, semVec });
     }
 
     this.stepHistory = rebuilt;
@@ -510,13 +638,13 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
       this.stepHistory.length > NEURAL_WINDOW_STEPS
         ? this.stepHistory.slice(-NEURAL_WINDOW_STEPS)
         : this.stepHistory;
-    const dynWin = new Float32Array(NEURAL_WINDOW_STEPS * NEURAL_DYNAMICS_DIM);
+    const dynWin = new Float32Array(NEURAL_WINDOW_STEPS * dynDim);
     const semWin = new Float32Array(NEURAL_WINDOW_STEPS * semDim);
     const padOffset = NEURAL_WINDOW_STEPS - tail.length;
     for (let i = 0; i < tail.length; i++) {
       const slot = padOffset + i;
-      dynWin.set(tail[i].dyn10, slot * NEURAL_DYNAMICS_DIM);
-      semWin.set(tail[i].sem64, slot * semDim);
+      dynWin.set(tail[i].dynVec, slot * dynDim);
+      semWin.set(tail[i].semVec, slot * semDim);
     }
 
     const neuralOut = this.neuralRunner.inferCognitiveWindow(dynWin, semWin, NEURAL_WINDOW_STEPS);
@@ -525,32 +653,43 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
   }
 
   private async recomputeSyntaxAlignment(): Promise<void> {
+    const now = Date.now();
     const entry = this.solutionCache.getEntry(this.problemText);
     const encoded = await this.syntaxEncoder.encodeWithSolution(this.activeStrokes, entry);
     this.latestSyntax = encoded;
-    this.cognition.setSyntaxObservation({
-      alignmentA: encoded.alignmentScore,
-      structuralBoundaryFactor: encoded.structuralBoundaryFactor,
-      matchedStepIndex: encoded.matchedStepIndex,
-      recognizedLatex: encoded.recognizedLatex,
-    });
+    this.cognition.setSyntaxObservation(
+      {
+        alignmentA: encoded.alignmentScore,
+        structuralBoundaryFactor: encoded.structuralBoundaryFactor,
+        matchedStepIndex: encoded.matchedStepIndex,
+        recognizedLatex: encoded.recognizedLatex,
+        anchorGap: encoded.anchorGap,
+        stepProgress: encoded.stepProgress,
+        pitfallProb: encoded.pitfallProb,
+      },
+      now,
+    );
+
+    if (encoded.matchedStepIndex >= 0) {
+      this.telemetryAggregator.recordStepAdvance(encoded.matchedStepIndex, encoded.stepProgress, now);
+    }
 
     if (encoded.hitPitfall && encoded.hitPitfall.triggerPattern !== this.lastPitfallTaggedKey) {
       this.lastPitfallTaggedKey = encoded.hitPitfall.triggerPattern;
       this.annotationTracker.addAnnotation({
-        timestamp: Date.now(),
+        timestamp: now,
         label: 'PITFALL_TRIGGERED',
         source: 'syntax_pitfall',
         note: encoded.hitPitfall.triggerPattern,
       });
+      this.telemetryAggregator.recordPitfall(
+        encoded.hitPitfall.triggerPattern,
+        encoded.pitfallProb,
+        now,
+      );
     }
   }
 
-  /**
-   * 伴随式零负担微标注交互入口：
-   * - `DEEP_THINKING_HOLD`：记录深度思考负样本并暂时静默 8.5 秒防打扰；
-   * - `STUCK_CONCEPT_GAP` / `STUCK_CALCULATION`：记录卡壳强正样本并产出对应风格的即时触发事件。
-   */
   public recordCompanionAnnotation(
     label: 'DEEP_THINKING_HOLD' | 'STUCK_CONCEPT_GAP' | 'STUCK_CALCULATION',
     nowMs = Date.now(),
@@ -597,7 +736,6 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
     const cognitiveState = this.cognition.updateFromDiagnostics(nowMs, diagnostics, thresholds);
     const interventionThreshold = this.policy.getInterventionThreshold();
 
-    // 1. 隐式反馈闭环：观察提示后 5 秒内是否恢复主动书写
     const settledFeedback = this.observeImplicitRecovery(
       nowMs,
       diagnostics,
@@ -614,7 +752,6 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
 
     const activelyWriting = diagnostics.rate >= 2 && diagnostics.pauseMs < 450;
 
-    // 2. 记录自适应降采样轨迹与自监督顺畅样本
     this.annotationTracker.recordDiagnosticsSample(
       nowMs,
       cognitiveState,
@@ -622,7 +759,6 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
       activelyWriting,
     );
 
-    // 3. 状态机自主介入通道（个人分位数 + 逻辑边界异常 + 擦除犹豫抖动 + 歧路漂移多门控联合判定）
     let cognitiveStallEvent: StallEvent | null = null;
     const cooldownOk =
       diagnostics.cooldownMs <= 0 &&
@@ -644,11 +780,18 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
       (cognitiveState.speedInstability >= 0.14 || cognitiveState.resistanceR >= 0.5);
     const pitfallDrift =
       cognitiveState.alignmentA <= -0.45 ||
+      cognitiveState.pitfallProb >= 0.68 ||
       cognitiveState.cognitiveCategory === 'DIRECTION_DRIFT_PITFALL';
+    // 图四图谱滞后判定门：在同一步骤长期无跃迁且缺失核心锚点（且不在刚跨步心算脉冲窗口内）时接管报警
+    const graphStepStagnationStall =
+      minPauseGuard &&
+      cognitiveState.stepStagnation >= 0.55 &&
+      cognitiveState.anchorGap >= 0.5 &&
+      cognitiveState.stepAdvancePulse < 0.3;
     const thinkingHoldSuppressed =
-      cognitiveState.cognitiveCategory === 'DEEP_THINKING_HOLD' &&
-      !pitfallDrift &&
-      cognitiveState.eraseStress < 0.35;
+      ((cognitiveState.cognitiveCategory === 'DEEP_THINKING_HOLD' && cognitiveState.eraseStress < 0.35) ||
+        (cognitiveState.stepAdvancePulse >= 0.45 && cognitiveState.eraseStress < 0.3)) &&
+      !pitfallDrift;
     const neuralMicroHesitation =
       cognitiveState.cognitiveCategory === 'CALC_MICRO_HESITATION' && diagnostics.pauseMs >= 1350;
     const neuralStuck =
@@ -662,6 +805,7 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
         severePersonalStall ||
         hesitantEraseStall ||
         pitfallDrift ||
+        graphStepStagnationStall ||
         neuralStuck ||
         neuralMicroHesitation);
     const sustainWindowMs = pitfallDrift
@@ -696,6 +840,8 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
     } else {
       this.stateTriggerStartedAt = null;
     }
+
+    this.telemetryAggregator.onTick(cognitiveState, diagnostics, cognitiveStallEvent, nowMs);
 
     return {
       cognitiveState,
@@ -761,9 +907,13 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
       speedRatio: this.lastSpeedRatio,
       triggerKind: type,
       cognitiveCategory: state.cognitiveCategory,
+      anchorGap: state.anchorGap,
+      stepStagnation: state.stepStagnation,
+      pitfallProb: state.pitfallProb,
     });
     const resolvedStyle = preferredStyle ?? selection.style;
     this.latestSelection = { style: resolvedStyle, context: selection.context };
+    this.telemetryAggregator.recordHintShown();
     return resolvedStyle;
   }
 
@@ -772,7 +922,6 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
     level: HintLevel,
     style: HintStyle,
   ): string | null {
-    // 若命中共性易错歧路且为微轻推/首层触发，优先下发精确歧路反问预警
     if ((level === 0 || level === 1) && this.latestSyntax?.hitPitfall?.warningHint) {
       return this.latestSyntax.hitPitfall.warningHint;
     }
@@ -837,6 +986,9 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
             speedRatio: this.lastSpeedRatio,
             triggerKind: 'pause_erase',
             cognitiveCategory: state.cognitiveCategory,
+            anchorGap: state.anchorGap,
+            stepStagnation: state.stepStagnation,
+            pitfallProb: state.pitfallProb,
           });
     this.pendingObs = {
       style,
@@ -901,6 +1053,8 @@ export class HandwritingPulseEngine implements IHandwritingPulseEngine {
       annotationCounts: this.annotationTracker.getCountsByLabel(),
       stateTrace: this.annotationTracker.getStateTrace(),
       cachedProblems: this.solutionCache.exportAllEntries(),
+      learnerTwin: this.knowledgeTracer.getTwin(),
+      currentTelemetry: this.buildSessionTelemetrySnapshot(),
     };
   }
 }

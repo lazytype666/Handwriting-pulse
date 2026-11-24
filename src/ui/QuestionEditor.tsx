@@ -36,16 +36,17 @@ type Props = {
 type Message = { kind: 'info' | 'error'; text: string };
 
 const OCR_SOURCE_LABEL: Record<string, string> = {
-  vlm_local: '本地视觉小模型提取 LaTeX',
-  vlm_cloud: '云端视觉模型提取 LaTeX',
-  mlkit_llm_refined: '端侧 ML Kit + 本地数学小模型公式修复',
+  vlm_local: '本地视觉模型提取 LaTeX',
+  vlm_cloud: '商用 VLM API 提取 LaTeX',
+  mlkit_llm_refined: '端侧 ML Kit + 公式修复',
   mlkit_local: '设备端 ML Kit 离线识别',
 };
 
 export function QuestionEditor({ question, engine, onSave, onClose }: Props) {
   const [draft, setDraft] = useState(question);
-  const [busy, setBusy] = useState<OcrSource | null>(null);
+  const [busy, setBusy] = useState<OcrSource | 'retry' | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
+  const [lastCropped, setLastCropped] = useState<{ source: OcrSource; uri: string } | null>(null);
   const running = useRef(false);
 
   const previewBlocks = useMemo(() => parseLatexBlocks(draft.trim()), [draft]);
@@ -55,28 +56,26 @@ export function QuestionEditor({ question, engine, onSave, onClose }: Props) {
   );
   const vlmReady = hasConfiguredVlmEndpoint();
 
-  async function recognize(source: OcrSource) {
+  async function recognize(source: OcrSource, reuseCroppedUri?: string) {
     if (running.current) return;
     running.current = true;
     Keyboard.dismiss();
     setMessage(null);
-    setBusy(source);
+    setBusy(reuseCroppedUri ? 'retry' : source);
     try {
-      const captured = await captureProblemForIngest(source);
+      const captured = await captureProblemForIngest(source, reuseCroppedUri);
       if (captured === null) return;
+      setLastCropped({ source, uri: captured.uri });
 
       let recognizedText = captured.mlkitText ?? '';
       let sourceNote = OCR_SOURCE_LABEL.mlkit_local;
 
       if (engine) {
-        if (captured.mode === 'vlm_only' || captured.mode === 'mlkit_with_vlm') {
-          const ingested = await engine.ingestProblemDraftFromImage(
-            captured.uri,
-            captured.mlkitText,
-          );
+        if (captured.mode === 'vlm_only') {
+          const ingested = await engine.ingestProblemDraftFromImage(captured.uri);
           recognizedText = ingested.problemText;
           sourceNote =
-            (ingested.ocrSource && OCR_SOURCE_LABEL[ingested.ocrSource]) || sourceNote;
+            (ingested.ocrSource && OCR_SOURCE_LABEL[ingested.ocrSource]) || OCR_SOURCE_LABEL.vlm_cloud;
         } else if (captured.mlkitText) {
           const ingested = await engine.ingestProblemDraftFromOcr(captured.mlkitText);
           recognizedText = ingested.problemText;
@@ -93,9 +92,10 @@ export function QuestionEditor({ question, engine, onSave, onClose }: Props) {
         const head = previous.trimEnd();
         return head ? head + '\n\n' + recognizedText : recognizedText;
       });
+      setLastCropped(null);
       setMessage({
         kind: 'info',
-        text: `已通过「${sourceNote}」填入预览。请核对公式与上下标后点「完成」，系统将在后台静默生成解题图谱并封存答案。`,
+        text: `已通过「${sourceNote}」填入预览。请核对公式与上下标后点「完成」，系统将在后台生成解题图谱、动态检测 Logits 与封存答案。`,
       });
     } catch (error) {
       setMessage({
@@ -121,7 +121,7 @@ export function QuestionEditor({ question, engine, onSave, onClose }: Props) {
                 题干与解题图谱
               </Text>
               <Text style={styles.help}>
-                可粘贴任意题目（支持 $...$ 数学式），或拍照/选图裁剪识别；确认保存后在 5~30 秒审题期间由本地数学强化小模型/云端自动预解步骤图谱并封存答案。
+                可粘贴任意题目（支持 $...$ 数学式），或拍照/选图裁剪后直连商用 VLM 识题；确认保存后后台将静默生成该题专属步骤图谱、易错点检测 Logits 并封存答案。
               </Text>
               <View style={styles.ocrRow}>
                 <ActionButton
@@ -138,10 +138,19 @@ export function QuestionEditor({ question, engine, onSave, onClose }: Props) {
                     void recognize('library');
                   }}
                 />
+                {lastCropped && message?.kind === 'error' && (
+                  <ActionButton
+                    label={busy === 'retry' ? '重识中…' : '用原裁剪图重识'}
+                    disabled={busy !== null}
+                    onPress={() => {
+                      void recognize(lastCropped.source, lastCropped.uri);
+                    }}
+                  />
+                )}
               </View>
               {IS_EXPO_GO && !vlmReady && (
                 <Text style={styles.notice}>
-                  Expo Go 不包含设备端 ML Kit OCR。请使用 EAS 开发构建/APK，或在 .env.local 配置本地/云端 VLM（EXPO_PUBLIC_VLM_MODEL）直接识题。
+                  未配置商用 VLM API（EXPO_PUBLIC_LLM_BASE_URL / EXPO_PUBLIC_LLM_API_KEY / EXPO_PUBLIC_VLM_MODEL）。当前仅支持手填题干或加载下方离线示例。
                 </Text>
               )}
               {message && (
@@ -227,8 +236,8 @@ export function QuestionEditor({ question, engine, onSave, onClose }: Props) {
                     解题图谱已缓存（
                     {cacheOverview.sourceMode === 'edge_offline'
                       ? '本地数学模型/离线图谱'
-                      : '云端预温'}
-                    ）：{cacheOverview.stepCount} 步路线 · {cacheOverview.pitfallCount} 条歧路
+                      : '云端商用模型预温'}
+                    ）：{cacheOverview.stepCount} 步路线 · {cacheOverview.pitfallCount} 条专属陷阱检查
                     {cacheOverview.hasSealedAnswer ? ' · 答案已封存' : ''}
                   </Text>
                   {cacheOverview.stepGoals.slice(0, 3).map((goal, idx) => (

@@ -1,8 +1,10 @@
 import type { Diagnostics, Stroke } from '../capture';
 import type { HintLevel } from '../hints/safety';
 import type { StallEvent, StallType, Thresholds } from '../stalls';
+import type { SessionLearningTelemetry } from '../agent';
 import type { AnnotationRecord, StateTraceSample } from './annotationTracker';
 import type { CognitiveState, CompanionMode, MotorFingerprint } from './cognitiveState';
+import type { CtcDecodeOptions } from './mathVocab';
 import type { FeedbackLogEntry, FeedbackSignal, HintStyle, PolicySnapshot } from './personalizedPolicy';
 import type { SolutionCacheEntry } from './solutionCache';
 
@@ -20,6 +22,16 @@ export interface IInkSyntaxEncoderAdapter {
   encodeRecentStrokes(strokes: Stroke[]): Promise<{
     recognizedLatex: string;
     alignmentScore: number;
+  }>;
+  encodeRecentStrokesDetailed?(
+    strokes: Stroke[],
+    decodeOptions?: CtcDecodeOptions,
+  ): Promise<{
+    recognizedLatex: string;
+    alignmentScore: number;
+    semPooled?: Float32Array;
+    tokenPosteriors?: Float32Array;
+    backend?: string;
   }>;
 }
 
@@ -63,6 +75,8 @@ export interface EngineSessionPayload {
     feedbackLogs: FeedbackLogEntry[];
     cachedProblems: SolutionCacheEntry[];
   };
+  /** 个性化学习智能体：单题全过程行为、手写习惯与 BKT 认知摘要 */
+  learningTelemetry?: SessionLearningTelemetry;
 }
 
 export interface EngineDiagnosticsTick {
@@ -78,6 +92,7 @@ export interface IHandwritingPulseEngine {
   ingestProblemImageUri?(imageUri: string): Promise<string>;
   onStrokeComplete?(stroke: Stroke): Promise<void>;
   onStrokeUndo?(stroke: Stroke): Promise<void>;
+  onStrokeErase?(stroke: Stroke): Promise<void>;
   setCompanionMode(mode: CompanionMode): void;
   setSemanticAlignment(alignmentA: number): void;
   processDiagnosticsTick(

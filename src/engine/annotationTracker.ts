@@ -50,6 +50,8 @@ export interface StateTraceSample {
   S: number;
   P: number;
   matchedStepIndex: number;
+  anchorGap?: number;
+  stepProgress?: number;
 }
 
 const MAX_TRACE_POINTS = 2400;
@@ -59,13 +61,6 @@ const FLUENT_COOLDOWN_MS = 12000;
 
 /**
  * 零负担伴随式微标注协议与三维状态轨迹采集器。
- *
- * 【自研实现】设计思路：
- * 1. 自动捕获隐式行为标签（橡皮擦/撤销 → SELF_CORRECTION；提示后 5 秒恢复书写 → HINT_EFFECTIVE；
- *    连续高动量低阻力书写 → FLUENT_DERIVATION），无需学生事后手工逐帧打标；
- * 2. 兼容前端伴随胶囊的少量显式标签（DEEP_THINKING_HOLD / STUCK_CONCEPT_GAP / STUCK_CALCULATION），
- *    用于精确区分“深度心算勿扰”与“需要启发”两类核心训练样本；
- * 3. 以防内存膨胀的自适应降采样频率记录 [M, R, A, S, P] 轨迹，可直接导出用于后续 ML 训练评估。
  */
 export class AnnotationTracker {
   private annotations: AnnotationRecord[] = [];
@@ -119,7 +114,6 @@ export class AnnotationTracker {
     matchedStepIndex: number,
     activelyWriting: boolean,
   ): void {
-    // 1. 自监督顺畅推导区间采集
     if (activelyWriting && state.momentumM >= 0.68 && state.resistanceR <= 0.25) {
       if (this.fluentStartedAt === null) {
         this.fluentStartedAt = nowMs;
@@ -141,7 +135,6 @@ export class AnnotationTracker {
       this.fluentStartedAt = null;
     }
 
-    // 2. 自适应节流采样三维状态演化轨迹
     const deltaBig =
       this.lastTraceState !== null &&
       (Math.abs(state.momentumM - this.lastTraceState.momentumM) >= 0.08 ||
@@ -166,6 +159,8 @@ export class AnnotationTracker {
       S: Number(state.surpriseScore.toFixed(3)),
       P: Number(state.interventionScore.toFixed(3)),
       matchedStepIndex,
+      anchorGap: Number(state.anchorGap.toFixed(3)),
+      stepProgress: Number(state.stepProgress.toFixed(3)),
     });
   }
 
